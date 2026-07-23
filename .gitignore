@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+
+# Generated models, weights and evolution metadata
+artifacts/
+
+# Training output and recorded battles
+parsing/
+docs/
+*.egg-info/
