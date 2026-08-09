@@ -9,3 +9,12 @@ artifacts/
 parsing/
 docs/
 *.egg-info/
+
+# Harness per-session state and logs
+runs/
+*.pkl
+
+# Benchmark output files
+after_bench.txt
+baseline_*.txt
+*_bench.txt

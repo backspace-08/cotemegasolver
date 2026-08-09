@@ -1,11 +1,16 @@
 """Authoritative COTE Megaverse rules and immutable game transitions."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import Iterable
+from random import Random
 
 BASE_HP = 6000
 BASE_ATK = 2000
+HP_POOL = (5700, 5800, 5900, 6000, 6100, 6200, 6300)
+ATK_POOL = (1900, 2000, 2100)
 MAX_BONUS = 4
 MAX_ACTIONS = 8
 TURN_ACTIONS = {1: 1, 2: 2, 3: 2, 4: 2, 5: 3, 6: 3, 7: 4}
@@ -30,6 +35,22 @@ def rounded_damage(value: float) -> int:
     return round(value / 100) * 100
 
 
+def exchange_damage(attacker: Character, defender: Character, attacks: int) -> int:
+    """Round one aggregate exchange once, after multiplying all hits."""
+    if attacks <= 0:
+        return 0
+    return rounded_damage(attacker.atk * multiplier(attacker.type, defender.type) * attacks)
+
+
+def attacks_to_kill(attacker: Character, defender: Character, shields: int = 0,
+                    max_attacks: int = MAX_ACTIONS) -> int | None:
+    """Find the minimum total attacks, including shields, for a lethal exchange."""
+    for total in range(max(0, shields) + 1, max_attacks + 1):
+        if exchange_damage(attacker, defender, total - shields) >= defender.hp:
+            return total
+    return None
+
+
 def base_budget(turn: int) -> int:
     return min(TURN_ACTIONS.get(turn, 4), 4)
 
@@ -39,6 +60,7 @@ class Character:
     type: Type
     hp: int = BASE_HP
     atk: int = BASE_ATK
+    max_hp: int = BASE_HP
 
     @property
     def alive(self):
@@ -49,6 +71,7 @@ class Character:
 class Side:
     characters: tuple[Character, ...]
     active: int = 0
+    stack_order: tuple[int, ...] = ()
     bonus: int = 0
     shields: int = 0
     actions: int = 0
@@ -66,6 +89,9 @@ class Side:
     @property
     def lost(self):
         return self.alive_count == 0
+
+    def normalized_order(self):
+        return self.stack_order or tuple(range(len(self.characters)))
 
 
 def next_budget(turn: int, side: Side) -> int:
@@ -137,35 +163,61 @@ def apply(state: GameState, allocation: Allocation) -> GameState:
         raise ValueError("allocation must spend every remaining action")
     active = actor.active
     switch_used = actor.voluntary_switch_used
+    order = list(actor.normalized_order())
     if allocation.switch:
         if allocation.switch_to == active or not actor.characters[allocation.switch_to].alive:
             raise ValueError("invalid switch target")
         active = allocation.switch_to
         switch_used = True
+        order.remove(active)
+        order.insert(0, active)
     blocked = min(allocation.attacks, target.shields)
     hits = allocation.attacks - blocked
-    damage = rounded_damage(
-        actor.characters[active].atk * multiplier(
-            actor.characters[active].type, target.active_character.type) * hits)
+    damage = exchange_damage(actor.characters[active], target.active_character, hits)
     characters = list(target.characters)
     victim = characters[target.active]
     characters[target.active] = replace(victim, hp=max(0, victim.hp - damage))
     target_active = target.active
     forced = target.forced_promotion
     if not characters[target_active].alive:
-        alive = [i for i, character in enumerate(characters) if character.alive]
-        target_active = alive[0] if alive else target_active
+        # Promote the next living character from the TARGET's own stack order,
+        # never from the actor's. Filter out the dead active and any dead or
+        # duplicated entries, preserving relative order, and rebuild a clean
+        # stack with the promoted character first.
+        seen = set()
+        living = []
+        for i in target.normalized_order():
+            if i != target.active and i not in seen and characters[i].alive:
+                seen.add(i)
+                living.append(i)
         forced = True
-    new_actor = replace(actor, active=active, bonus=min(MAX_BONUS, actor.bonus + allocation.bonuses),
+        if living:
+            target_active = living[0]
+            target_order = (target_active,) + tuple(i for i in living[1:])
+        else:
+            target_active = target.active
+            target_order = tuple(target.normalized_order())
+    else:
+        target_order = tuple(target.normalized_order())
+    new_actor = replace(actor, active=active, stack_order=tuple(order), bonus=min(MAX_BONUS, actor.bonus + allocation.bonuses),
                         shields=allocation.defends, actions=0,
                         voluntary_switch_used=switch_used)
     new_target = replace(target, characters=tuple(characters), active=target_active,
+                         stack_order=tuple(target_order),
                          shields=0, forced_promotion=forced)
     if state.player_to_move:
         return replace(GameState(new_actor, new_target, state.turn + 1, False)).prepare()
     return replace(GameState(new_target, new_actor, state.turn + 1, True)).prepare()
 
 
-def initial(player: Iterable[Type], opponent: Iterable[Type]) -> GameState:
-    make = lambda team: Side(tuple(Character(item) for item in team))
+def initial(player: Iterable[Type], opponent: Iterable[Type], rng: Random | None = None) -> GameState:
+    rng = rng or Random()
+
+    def make(team):
+        characters = tuple(
+            Character(item, hp := rng.choice(HP_POOL), rng.choice(ATK_POOL), hp)
+            for item in team
+        )
+        return Side(characters, stack_order=tuple(range(3)))
+
     return GameState(make(tuple(player)), make(tuple(opponent))).prepare()
