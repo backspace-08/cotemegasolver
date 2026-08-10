@@ -20,6 +20,7 @@ import json
 import os
 import pickle
 import random
+import re
 import sys
 
 from dataclasses import replace
@@ -30,8 +31,10 @@ from cote_megaverse.agent import Planner
 from cote_megaverse.interactive import (PlayerQuit, human_allocation,
                                         show_outcome, show_resolution,
                                         show_state)
-from cote_megaverse.rules import (Allocation, GameState, MAX_BONUS, Type,
-                                  apply, base_budget, exchange_damage, initial)
+from cote_megaverse.rules import (Allocation, GameState, MAX_ACTIONS,
+                                  MAX_BONUS, Type, apply, attacks_to_kill,
+                                  base_budget, exchange_damage, initial,
+                                  multiplier)
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 RUN = "default"
@@ -111,6 +114,113 @@ def render(state, game_index=None, session_total=None, history=None):
     return "\n".join(lines)
 
 
+def parse_intent(raw):
+    """Tolerant intent parser. Returns (a, d, b, sw_1based|None) or None for '-'.
+
+    Accepts positional numbers (separators , ; space /): '2,1', '2 1', '2/1',
+    '2,0,1,2' (4th = 1-based switch target). Also keyword tokens: 'a2', 'd1',
+    's1' (shield), 'b3', 'sw2' / 'switch 2'. Anything else is an error.
+    """
+    raw = (raw or "").strip()
+    if not raw or raw == "-":
+        return None
+    toks = [t for t in re.split(r"[,;\s/]+", raw.lower()) if t]
+    if all(t.isdigit() for t in toks):
+        vals = [int(t) for t in toks]
+        a = vals[0] if len(vals) > 0 else 0
+        d = vals[1] if len(vals) > 1 else 0
+        b = vals[2] if len(vals) > 2 else 0
+        sw = vals[3] if len(vals) > 3 else None
+        return (a, d, b, sw)
+    a = d = b = 0
+    sw = None
+    for tok in toks:
+        if tok.startswith("sw") or tok.startswith("switch"):
+            rest = tok[2:] if tok.startswith("sw") else tok[6:]
+            if rest.isdigit():
+                sw = int(rest)
+            else:
+                raise SystemExit(f"bad switch target: {raw!r}")
+        elif tok.startswith("a"):
+            a = int(tok[1:])
+        elif tok.startswith("d") or tok.startswith("s"):
+            d = int(tok[1:])
+        elif tok.startswith("b"):
+            b = int(tok[1:])
+        else:
+            raise SystemExit(f"cannot parse move: {raw!r}")
+    return (a, d, b, sw)
+
+
+def _bot_noatk_streak(history):
+    """Consecutive recent bot turns without an attack (the 'wall' signal)."""
+    n = 0
+    for h in reversed(history or []):
+        if "BOT" not in h:
+            continue
+        if "did not attack" in h:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _side_dict(side, budget=None, reveal_private=False):
+    ch = side.characters[side.active]
+    d = {"a": side.active, "T": ch.type.name, "hp": ch.hp, "atk": ch.atk,
+         "alive": [[i, c.type.name, c.hp, c.atk]
+                   for i, c in enumerate(side.characters)]}
+    if budget is not None:
+        d["bud"] = budget
+    if reveal_private:
+        d["bank"] = side.bonus
+        d["sh"] = side.shields
+    return d
+
+
+def compact_render(game):
+    """One-turn decision payload: everything the player needs + precomputed
+    hints (kill thresholds, worst bot reply, shields to survive, switches)."""
+    st = game["state"]
+    your, bot = st.player, st.opponent
+    ya = your.characters[your.active]
+    ba = bot.characters[bot.active]
+    sbot = game.get("sBot", 0)
+    mult = multiplier(ya.type, ba.type)
+    nxt = min(MAX_ACTIONS, base_budget(st.turn + 1) + MAX_BONUS)
+    worst = exchange_damage(ba, ya, nxt) if nxt > 0 else 0
+    shld = None
+    for d in range(0, nxt + 1):
+        if exchange_damage(ba, ya, nxt - d) < ya.hp:
+            shld = d
+            break
+    sw_opts = [[i + 1, c.type.name, multiplier(c.type, ba.type),
+                exchange_damage(c, ba, 1)]
+               for i, c in enumerate(your.characters)
+               if i != your.active and c.alive]
+    hint = {"mult": mult,
+            "kill0": attacks_to_kill(ya, ba, 0),
+            "killS": attacks_to_kill(ya, ba, sbot),
+            "sBot": sbot,
+            "worst": worst,
+            "shld": shld,
+            "sw": sw_opts,
+            "streak": _bot_noatk_streak(game.get("history"))}
+    obj = {"t": st.turn,
+           "turn": "YOU" if st.player_to_move else "BOT",
+           "seed": game["seed"],
+           "you": _side_dict(your, your.actions if st.player_to_move else None,
+                             reveal_private=True),
+           "bot": _side_dict(bot),
+           "hint": hint,
+           "hist": (game.get("history") or [])[-3:]}
+    return obj
+
+
+def print_json(obj):
+    print(json.dumps(obj, separators=(",", ":")))
+
+
 def make_game(seed, depth, temp, game_index=None, force_ai_first=None,
               force_human_first=None):
     rng = random.Random(seed)
@@ -131,7 +241,7 @@ def make_game(seed, depth, temp, game_index=None, force_ai_first=None,
     planner = Planner(depth=depth, temperature=temp, rng=bot_rng)
     return {"state": state, "planner": planner, "seed": seed,
             "ai_starts": ai_starts, "log": [], "history": [],
-            "game_index": game_index}
+            "sBot": 0, "compact": False, "game_index": game_index}
 
 
 def record_result(game, winner):
@@ -169,7 +279,11 @@ def _finish_game_if_needed(game):
     winner = _winner_of(game)
     sess = game.get("session")
     if sess is None:
-        print(f"=== {winner} WIN ===")
+        if game.get("compact"):
+            print_json({"done": winner,
+                        "plies": len(game.get("log", []))})
+        else:
+            print(f"=== {winner} WIN ===")
         return
     record_result(game, winner)
     sess["done"] += 1
@@ -195,9 +309,25 @@ def cmd_new(args):
     game = make_game(int(args.seed) if args.seed else 0, args.depth, args.temp,
                      force_ai_first=args.ai_first,
                      force_human_first=args.human_first)
+    game["compact"] = args.compact
+    if args.compact:
+        # Same rationale as in cmd_move: never hand back a state the player
+        # cannot act on. If the bot moves first, resolve its turn now so the
+        # opening response already contains our budget.
+        state = game["state"]
+        while not (state.player_to_move
+                   or state.player.lost or state.opponent.lost):
+            state = run_bot(state, game["planner"], verbose=False,
+                            history=game.get("history"))
+            game["state"] = state
     save(game)
-    print(f"[first mover: {'BOT' if game['ai_starts'] else 'YOU'}]")
-    print(render(game["state"]))
+    if args.compact:
+        print_json({"seed": game["seed"],
+                    "first": "BOT" if game["ai_starts"] else "YOU",
+                    "state": compact_render(game)})
+    else:
+        print(f"[first mover: {'BOT' if game['ai_starts'] else 'YOU'}]")
+        print(render(game["state"]))
 
 
 def _play_one_game(game):
@@ -261,62 +391,86 @@ def cmd_session(args):
 def cmd_move(args):
     game = load()
     state, planner = game["state"], game["planner"]
+    compact = game.get("compact", False)
     # Advance any pending bot turns first (handles random/bot first mover).
     while not state.player_to_move:
         if state.player.lost or state.opponent.lost:
             break
-        state = run_bot(state, planner, history=game.get("history"))
+        state = run_bot(state, planner, verbose=not compact,
+                        history=game.get("history"))
         game["state"] = state
     if state.player_to_move and args.move and args.move != "-":
-        parts = [int(x) for x in args.move.split(",")]
-        a = parts[0] if len(parts) > 0 else 0
-        d = parts[1] if len(parts) > 1 else 0
-        b = parts[2] if len(parts) > 2 else 0
-        # The CLI switch target is 1-based (matching interactive.py and the
-        # docs); Allocation.switch_to is 0-based.
-        sw = (parts[3] - 1) if len(parts) > 3 else None
-        # Budget ergonomics: you specify intent, the leftover is auto-banked.
-        # No need to sum attacks+defends+bonuses exactly to the budget.
+        intent = parse_intent(args.move)
+        a, d, b = intent[0], intent[1], intent[2]
+        # The CLI switch target is 1-based; Allocation.switch_to is 0-based.
+        sw = (intent[3] - 1) if intent[3] is not None else None
+        # Budget ergonomics: intent, leftover is auto-banked (up to the bank
+        # cap); any excess over the cap becomes shields so all actions are spent.
         budget = state.player.actions
         used = a + d + b + (1 if sw is not None else 0)
         if used > budget:
             raise SystemExit(f"budget exceeded: {used} > {budget}")
-        b += budget - used
+        room = MAX_BONUS - state.player.bonus
+        to_bank = min(budget - used, room)
+        b += to_bank
+        d += (budget - used) - to_bank
         move = human_move(state, a, d, b, sw)
         before = state
         state = apply(state, move)
         planner.observe(move.attacks, move.bonuses, move.switch,
                         budget=before.player.actions)
-        # The opponent's shields are revealed on EVERY resolution, regardless
-        # of whether we attacked: if they wasted shields, we see that waste.
+        # The opponent's shields are revealed on EVERY resolution; remember
+        # the latest revealed value as public info.
+        game["sBot"] = before.opponent.shields
         if move.attacks:
             blocked = min(move.attacks, before.opponent.shields)
             landed = move.attacks - blocked
             dmg = exchange_damage(before.player.active_character
                                   if not move.switch else before.player.characters[move.switch_to],
                                   before.opponent.active_character, landed)
-            print(f"[YOU] {move.label}  (bot held {before.opponent.shields} shields)")
             hist = (f"T{before.turn} YOU: a{move.attacks} -> {dmg} dmg "
                     f"(bot held {before.opponent.shields})")
         else:
-            print(f"[YOU] {move.label}  (bot held {before.opponent.shields} shields)")
             hist = (f"T{before.turn} YOU: did not attack "
                     f"(bot held {before.opponent.shields})")
+        if not compact:
+            print(f"[YOU] {move.label}  (bot held {before.opponent.shields} shields)")
         game["log"].append(move.label)
         game["history"].append(hist)
+    # Compact mode is for automated players, where every response costs a whole
+    # model round-trip. Resolving our allocation leaves the bot to move, so a
+    # naive render would hand back a state with no budget and no decision in it,
+    # forcing a second "-" call that carries no information. Measured on seeds
+    # 500-510 that dead call was ~49% of all round-trips. So run the bot's reply
+    # here and always answer with a position the player can actually act on.
+    if compact:
+        while not (state.player_to_move
+                   or state.player.lost or state.opponent.lost):
+            state = run_bot(state, planner, verbose=False,
+                            history=game.get("history"))
+            game["state"] = state
     game["state"] = state
     save(game)
-    print()
-    if state.player.lost or state.opponent.lost:
-        _finish_game_if_needed(game)
+    if compact:
+        if state.player.lost or state.opponent.lost:
+            _finish_game_if_needed(game)
+        else:
+            print_json(compact_render(game))
     else:
-        sess = game.get("session")
-        idx, total = (sess["done"] + 1, sess["total"]) if sess else (None, None)
-        print(render(state, idx, total, history=game.get("history")))
+        print()
+        if state.player.lost or state.opponent.lost:
+            _finish_game_if_needed(game)
+        else:
+            sess = game.get("session")
+            idx, total = (sess["done"] + 1, sess["total"]) if sess else (None, None)
+            print(render(state, idx, total, history=game.get("history")))
 
 
 def cmd_view(args):
     game = load()
+    if game.get("compact"):
+        print_json(compact_render(game))
+        return
     sess = game.get("session")
     idx, total = (sess["done"] + 1, sess["total"]) if sess else (None, None)
     print(render(game["state"], idx, total, history=game.get("history")))
@@ -328,15 +482,24 @@ def cmd_end(args):
         return
     game = load()
     s = game["state"]
+    compact = game.get("compact", False)
     if s.player.lost or s.opponent.lost:
         winner = _winner_of(game)
         record_result(game, winner)
-        print(f"final result recorded: {winner} (seed {game['seed']})")
+        if compact:
+            print_json({"result": winner, "seed": game["seed"],
+                        "plies": len(game.get("log", []))})
+        else:
+            print(f"final result recorded: {winner} (seed {game['seed']})")
     else:
-        print(f"game aborted mid-way (seed {game['seed']}); not recorded")
-    print(f"human hp left {sum(c.hp for c in s.player.characters)}, "
-          f"bot hp left {sum(c.hp for c in s.opponent.characters)}")
-    print(f"log: {game['log']}")
+        if compact:
+            print_json({"result": "aborted", "seed": game["seed"]})
+        else:
+            print(f"game aborted mid-way (seed {game['seed']}); not recorded")
+    if not compact:
+        print(f"human hp left {sum(c.hp for c in s.player.characters)}, "
+              f"bot hp left {sum(c.hp for c in s.opponent.characters)}")
+        print(f"log: {game['log']}")
     if os.path.exists(_state_path()):
         os.remove(_state_path())
 
@@ -368,22 +531,20 @@ def run_bot(state, planner, verbose=True, history=None):
     # whether the bot attacked (symmetrical with the human's UI). So the bot
     # observes them every turn.
     planner.observe_shields(before.player.shields)
-    if verbose:
-        # Fairness: the bot's defends (shields) and bonuses (bank) are HIDDEN.
-        # Only its attacks, the damage, and the shields it consumed (revealed
-        # on the human's own attack) are public. Never print move.label here.
-        if move.attacks:
-            blocked = min(move.attacks, before.player.shields)
-            landed = move.attacks - blocked
-            dmg = exchange_damage(planning.player.active_character
-                                  if not move.switch else planning.player.characters[move.switch_to],
-                                  before.player.active_character, landed)
+    if move.attacks:
+        blocked = min(move.attacks, before.player.shields)
+        landed = move.attacks - blocked
+        dmg = exchange_damage(planning.player.active_character
+                              if not move.switch else planning.player.characters[move.switch_to],
+                              before.player.active_character, landed)
+        hist = (f"T{before.turn} BOT: a{move.attacks} -> {dmg} dmg "
+                f"(blocked {blocked})")
+        if verbose:
             print(f"[BOT] attacked {move.attacks} (blocked {blocked}, landed {landed}, dmg {dmg})")
-            hist = (f"T{before.turn} BOT: a{move.attacks} -> {dmg} dmg "
-                    f"(blocked {blocked})")
-        else:
+    else:
+        hist = f"T{before.turn} BOT: did not attack"
+        if verbose:
             print("[BOT] did not attack")
-            hist = f"T{before.turn} BOT: did not attack"
     if history is not None:
         history.append(hist)
     return after
@@ -402,6 +563,8 @@ def main():
                     help="human moves first (overrides the random coin flip)")
     pn.add_argument("--depth", type=int, default=2)
     pn.add_argument("--temp", type=float, default=0.12)
+    pn.add_argument("--compact", action="store_true",
+                    help="compact JSON output (LLM-friendly, one line per turn)")
     ps = sub.add_parser("session")
     ps.add_argument("--run", default="default")
     ps.add_argument("--games", type=int, default=20)

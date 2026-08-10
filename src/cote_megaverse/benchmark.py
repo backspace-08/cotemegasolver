@@ -6,8 +6,9 @@ from dataclasses import replace
 
 from .agent import Planner
 from .observation import observe
-from .rules import (MAX_ACTIONS, GameState, Type, apply, base_budget,
-                     exchange_damage, legal_allocations, initial)
+from .rules import (MAX_ACTIONS, MAX_BONUS, GameState, Type, apply,
+                     attacks_to_kill, base_budget, exchange_damage,
+                     legal_allocations, initial)
 
 
 def _policy_state(state: GameState) -> GameState:
@@ -120,6 +121,108 @@ def burster_human_move(state: GameState, planner: Planner,
     return max(moves, key=score)
 
 
+def burster2_human_move(state: GameState, planner: Planner,
+                        rng: random.Random):
+    """Human line as specified by the DeepSeek test subject.
+
+    1. Kill when the HP math says so, plus one extra attack, because the bot
+       is observed to hold 1-2 shields it never revealed.
+    2. When our budget cannot break a full wall, bank instead of feeding
+       attacks into shields -- but spend shields to absorb the incoming burst
+       rather than banking naked.
+    3. Once the budget exceeds the wall, dump everything into attacks.
+
+    Public information only: own budget, public turn, opponent HP/type.
+    ``_policy_state`` already zeroes the opponent's shields.
+    """
+    view = _policy_state(state)
+    moves = legal_allocations(view.player)
+    target = view.opponent.active_character
+    budget = view.player.actions
+    wall = MAX_BONUS                      # bot can hold at most 4 per turn
+    incoming = min(MAX_ACTIONS, base_budget(state.turn + 1) + MAX_BONUS)
+
+    def score(move):
+        attacker = (view.player.active_character if not move.switch
+                    else view.player.characters[move.switch_to])
+        # (1) lethal with a one-attack margin against hidden shields
+        need = attacks_to_kill(attacker, target, 0)
+        if need is not None and move.attacks >= need + 1:
+            return 10_000_000 + move.attacks
+        # (3) budget already beats the wall -> maximum volume
+        if budget > wall:
+            return 1_000_000 + exchange_damage(
+                attacker, target, max(0, move.attacks - wall)) * 10
+        # (2) cannot break the wall -> bank, but shield the incoming burst
+        survives = exchange_damage(view.opponent.active_character, attacker,
+                                   max(0, incoming - move.defends))
+        safe = int(survives < attacker.hp)
+        return safe * 100_000 + move.bonuses * 1_000 + move.defends * 100
+
+    return max(moves, key=score)
+
+
+def burster3_human_move(state: GameState, planner: Planner,
+                        rng: random.Random):
+    """Human line as specified by the Terra test subject.
+
+    Terra's verdict was continuous pressure, not patient banking:
+
+    1. Attack on nearly every turn, even at a small budget. Chip damage forces
+       the bot to react instead of letting it accumulate freely.
+    2. Switch when the target body has a type advantage over the bot's active,
+       or to save a body that dies to the bot's next worst-case burst.
+    3. When the bot's shields are low or absent, spend the whole budget on
+       attacks. Do not pre-shield against a threat that is not there -- that
+       passivity is exactly what sank ``burster2`` (0/40).
+    4. Refinement from the DeepSeek verdict: when going for a kill, prefer one
+       attack more than the HP math demands, because the bot is observed to
+       hold shields it never revealed.
+
+    The bot's shields are estimated by running the bot's own policy forward,
+    the same device ``reader_human_move`` already uses: it consumes public
+    information only and never reads ``state.opponent.shields``.
+    """
+    view = _policy_state(state)
+    moves = legal_allocations(view.player)
+    target = view.opponent.active_character
+    threat = view.opponent.active_character
+    bot_view = state.__class__(state.opponent, state.player, state.turn, True)
+    predicted_shields = planner.choose(bot_view).defends
+    # Worst case the bot can pay for next turn: base budget plus a full bank.
+    incoming = min(MAX_ACTIONS, base_budget(state.turn + 1) + MAX_BONUS)
+
+    def score(move):
+        current = view.player.active_character
+        attacker = (current if not move.switch
+                    else view.player.characters[move.switch_to])
+        landed = max(0, move.attacks - predicted_shields)
+        damage = exchange_damage(attacker, target, landed)
+        needed = attacks_to_kill(attacker, target, predicted_shields)
+        kills = int(needed is not None and move.attacks >= needed)
+        # (4) one extra attack over the arithmetic, for hidden shields.
+        margin = int(needed is not None and move.attacks >= needed + 1)
+        # (2) switch valuation: type advantage, or rescuing a doomed body.
+        switch_bonus = 0
+        if move.switch:
+            if (exchange_damage(attacker, target, 1)
+                    > exchange_damage(current, target, 1)):
+                switch_bonus += 2000
+            doomed = exchange_damage(threat, current, incoming) >= current.hp
+            rescued = exchange_damage(threat, attacker, incoming) < attacker.hp
+            if doomed and rescued:
+                switch_bonus += 3000
+            switch_bonus -= 800            # the action a switch costs
+        # (1)+(3) continuous pressure: attacking is the default, idling is not.
+        pressure = move.attacks * 400
+        if move.attacks == 0:
+            pressure -= 2500
+        return (kills * 1_000_000 + margin * 200_000 + damage * 10
+                + pressure + switch_bonus + move.defends * 50)
+
+    return max(moves, key=score)
+
+
 def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
               ai_starts=False, temperature=0.0):
     """Run one AI-vs-human-policy match with public-information updates."""
@@ -151,6 +254,10 @@ def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
                 move = reader_human_move(state, planner, rng)
             elif policy == "burster":
                 move = burster_human_move(state, planner, rng)
+            elif policy == "burster2":
+                move = burster2_human_move(state, planner, rng)
+            elif policy == "burster3":
+                move = burster3_human_move(state, planner, rng)
             else:
                 move = choose_human_policy(state, policy, rng)
             metrics["human_turns"] += 1
