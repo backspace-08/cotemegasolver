@@ -59,6 +59,28 @@ def _winrate_log_path():
     return os.path.join(_BASE, "runs", RUN, "winrate_log.json")
 
 
+def show_stats(run):
+    """Summarize winrate_log.json for --run: W/L/D and per-seat split."""
+    path = os.path.join(_BASE, "runs", run, "winrate_log.json")
+    entries = _read_json(path, [])
+    if not entries:
+        print("No recorded games in runs/%s yet." % run)
+        return
+    total = len(entries)
+    w = sum(1 for e in entries if e["result"] == "w")
+    d = sum(1 for e in entries if e["result"] == "d")
+    l = total - w - d
+    def seat(name):
+        s = [e for e in entries if e["seat"] == name]
+        if not s:
+            return "n/a"
+        sw = sum(1 for e in s if e["result"] == "w")
+        return "%.1f%%" % (100.0 * sw / len(s))
+    print("runs/%s: %d games  W=%d L=%d D=%d  win%%=%.1f  (ai_first %s, human_first %s)"
+          % (run, total, w, l, d, 100.0 * w / (total - d) if total > d else 0.0,
+             seat("ai_first"), seat("human_first")))
+
+
 def save(game):
     with open(_state_path(), "wb") as fh:
         pickle.dump(game, fh)
@@ -211,7 +233,7 @@ def compact_render(game):
            "seed": game["seed"],
            "you": _side_dict(your, your.actions if st.player_to_move else None,
                              reveal_private=True),
-           "bot": _side_dict(bot),
+           "bot": _side_dict(bot, bot.actions if not st.player_to_move else None),
            "hint": hint,
            "hist": (game.get("history") or [])[-3:]}
     return obj
@@ -291,8 +313,8 @@ def _finish_game_if_needed(game):
     print(f"=== GAME {done}/{total} finished: {winner} "
           f"(seed {game['seed']}, {len(game['log'])} plies) — recorded ===")
     if done >= total:
-        print("SESSION COMPLETE — all games recorded. Run:")
-        print("  python track_winrate.py show")
+        print("SESSION COMPLETE — all games recorded:")
+        show_stats(RUN)
         if os.path.exists(_state_path()):
             os.remove(_state_path())
         return
@@ -377,8 +399,8 @@ def run_session(total, start_seed, depth, temp):
         record_result(game, winner)
         print(f"\n=== GAME {game_index}/{total} finished: {winner} "
               f"(seed {game['seed']}, {len(game['log'])} plies) — recorded ===")
-    print("\nSESSION COMPLETE — all games recorded. Run:")
-    print("  python track_winrate.py show")
+    print("\nSESSION COMPLETE — all games recorded:")
+    show_stats(RUN)
 
 
 def cmd_session(args):
@@ -575,6 +597,7 @@ def main():
     pm.add_argument("move")
     pv = sub.add_parser("view"); pv.add_argument("--run", default="default")
     pe = sub.add_parser("end"); pe.add_argument("--run", default="default")
+    pst = sub.add_parser("stats"); pst.add_argument("--run", default="default")
     args = p.parse_args()
     _set_run(args.run)
     if args.cmd == "new":
@@ -587,6 +610,8 @@ def main():
         cmd_view(args)
     elif args.cmd == "end":
         cmd_end(args)
+    elif args.cmd == "stats":
+        show_stats(args.run)
     else:
         p.print_help()
 

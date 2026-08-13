@@ -1,0 +1,257 @@
+======================================================================
+ПРАВИЛЬНОЕ ПОНИМАНИЕ ИНФОРМАЦИИ В COTE MEGAVERSE
+======================================================================
+СПАСИБО ЗА ТЕРПЕНИЕ! Теперь понял правильно.
+======================================================================
+ЧТО Я ЗНАЮ НА МОМЕНТ МОЕГО ХОДА (Turn N)
+======================================================================
+ПУБЛИЧНО ИЗВЕСТНО:
+  ✓ Opponent available actions СЕЙЧАС (budget + bonus публичен)
+  ✓ Opponent потраченные shields на прошлом resolution
+  ✓ Opponent attacks на прошлом ходу (сколько hit было)
+  ✓ HP, ATK, types всех персонажей
+  ✓ Turn number
+СКРЫТО (НЕ ЗНАЮ):
+  ✗ Opponent ТЕКУЩИЕ shields (которые он держит прямо сейчас)
+  ✗ Opponent ТЕКУЩИЙ bonus bank (сколько он держит прямо сейчас)
+  ✗ Opponent allocation THIS TURN (что он делает прямо сейчас)
+======================================================================
+КЛЮЧЕВОЙ ИНСАЙТ ИЗ ТВОЕГО ПРИМЕРА
+======================================================================
+Turn 3 (AI ход):
+  "AI: 2 attacks vs 1 shields, 1 hit, 2500 dmg"
+  AI имел 2 actions
+  AI сделал 2 attacks
+  
+  ВЫВОД: 2 actions - 2 attacks = 0 remainder
+         -> AI НЕ поставил ни shields, ни bonus
+         -> На Turn 4 у AI будет base actions (2) + 0 bonus = 2 actions
+Turn 4 (Мой ход):
+  "Bonus: ....  (Actions: 2 + 0)"
+  
+  Это показывает AI bonus! Я ВИЖУ что у него 2+0 = 2 actions.
+  
+  НО: Я НЕ ЗНАЮ сколько из этих 2 actions он потратит на shields!
+======================================================================
+ЧТО Я МОГУ ВЫВЕСТИ (INFERENCE)
+======================================================================
+После каждого opponent хода я наблюдаю:
+  - total_attacks
+  - spent_shields
+  - switch (yes/no)
+  
+Из этого вывожу:
+  
+  remainder = actions - attacks - switch_cost
+  
+  Этот remainder был распределён между:
+    - shields (которые я только что увидел spent)
+    - bonus (который пошёл в bank)
+  
+  bonus_banked = remainder - spent_shields
+ПРИМЕР:
+Turn 3, AI ход:
+  AI actions: 2
+  AI attacks: 2
+  AI spent shields: 1 (который я поставил на Turn 2)
+  AI switch: no
+  
+  remainder = 2 - 2 - 0 = 0
+  
+  НО ПОДОЖДИ! Shields которые я вижу spent — это МОИ shields!
+  
+  Я НЕ ВИЖУ сколько AI поставил shields для Turn 4!
+======================================================================
+ПРАВИЛЬНАЯ ИНФОРМАЦИОННАЯ МОДЕЛЬ
+======================================================================
+На Turn N (мой ход), после opponent хода N-1:
+ИЗВЕСТНО:
+  1. Opponent available actions на ЕГО ход N-1: budget_N-1
+  2. Opponent attacks на ходу N-1: attacks_N-1
+  3. Opponent spent MY shields: my_shields (это МОИ shields!)
+  4. Opponent switch: switch_N-1
+  
+ВЫВОЖУ:
+  remainder_N-1 = budget_N-1 - attacks_N-1 - switch_N-1
+  
+  Этот remainder был распределён на:
+    - opponent shields для хода N (СКРЫТО от меня)
+    - opponent bonus в bank (СКРЫТО от меня)
+  
+  opp_shields_N + opp_bonus_banked_N-1 = remainder_N-1
+НО Я НЕ ЗНАЮ как именно распределено!
+ОДНАКО на следующем ходу (Turn N+1):
+  Opponent budget = base_N + bonus_revealed
+  
+  bonus_revealed = то что было banked на N-1
+  
+  Значит:
+    bonus_revealed = remainder_N-1 - opp_shields_N
+    
+  Когда я увижу spent opp_shields_N (после resolution Turn N),
+  я узнаю: bonus_revealed = remainder_N-1 - opp_shields_N
+======================================================================
+BELIEF TRACKING
+======================================================================
+На момент МОЕГО хода Turn N:
+Opponent на своём прошлом ходу (N-1) имел:
+  actions = A
+  attacks = X
+  remainder = R = A - X - switch
+  
+Opponent распределил R между:
+  shields_for_N (защита от МОЕЙ атаки)
+  bonus_banked (для хода N+1)
+Я НЕ ЗНАЮ это распределение до resolution!
+BELIEF DISTRIBUTION:
+  P(shields=0, bonus=R) = ?
+  P(shields=1, bonus=R-1) = ?
+  ...
+  P(shields=R, bonus=0) = ?
+Это зависит от opponent стратегии!
+Если opponent aggressive:
+  -> Больше probability на bonus
+  
+Если opponent defensive:
+  -> Больше probability на shields
+======================================================================
+NASH TABLE — ПРАВИЛЬНАЯ РАЗМЕРНОСТЬ
+======================================================================
+На момент моего хода я знаю:
+1. MY_ACTIONS: точно известно
+2. OPP_ACTIONS (на его следующем ходу): 
+   = base(turn+1) + ???
+   
+   НО я НЕ ЗНАЮ его bonus!
+   Потому что он только что распределил remainder, и я не знаю как!
+ПОЭТОМУ:
+nash_table[(atk, atd, my_actions, opp_actions)]
+Где:
+  atk: зависит от opp_shields (belief)
+  opp_actions: зависит от opp_bonus (belief)
+ОБА параметра имеют UNCERTAINTY!
+======================================================================
+ИТОГОВАЯ ТАБЛИЦА
+======================================================================
+ВАРИАНТ 1: Полная таблица (игнорируя uncertainty)
+nash_table[(atk, atd, my_actions, opp_actions)]
+atk ∈ [0..8]
+atd ∈ [0..8]
+my_actions ∈ [1..8]
+opp_actions ∈ [1..8]
+Размер: 9 × 9 × 8 × 8 = 5,184 записей
+Query с expected values:
+  expected_atk = weighted по shields belief
+  expected_opp_actions = base(turn+1) + expected_bonus
+ВАРИАНТ 2: Упрощённая (bucketing)
+atk ∈ [1, 2, 3, 4, 5+]
+atd ∈ [1, 2, 3, 4, 5+]
+my_actions ∈ [1, 2, 3, 4+]
+opp_actions ∈ [1, 2, 3, 4+]
+Размер: 5 × 5 × 4 × 4 = 400 записей
+ВАРИАНТ 3: Игнорировать opp_actions (упростить модель)
+nash_table[(atk, atd, my_actions)]
+Размер: 9 × 9 × 8 = 648 записей
+Assume opponent имеет "средние" actions (2-3)
+======================================================================
+РЕКОМЕНДАЦИЯ
+======================================================================
+Для ПРОТОТИПА:
+nash_table[(atk, atd, my_actions)]
+648 записей, ~5 часов pre-compute
+Query:
+  atk = expected_atk(opp_shields_belief)
+  atd = attacks_to_kill(opp, me, my_shields)
+  strategy = nash_table[(atk, atd, my_actions)]
+Ignore opponent future actions в first version.
+УЛУЧШЕНИЕ:
+nash_table[(atk, atd, my_actions, opp_actions)]
+5,184 записей, ~43 часа
+Query:
+  expected_opp_actions = base(turn+1) + expected_bonus(belief)
+  strategy = nash_table[(atk, atd, my_actions, expected_opp_actions)]
+======================================================================
+BELIEF TRACKER — ЧТО ОТСЛЕЖИВАТЬ
+======================================================================
+После каждого opponent хода обновляю belief:
+def update_belief_after_opp_turn(observation):
+    """
+    observation:
+      - opp_actions (budget)
+      - opp_attacks
+      - opp_switch
+      - opp_spent_MY_shields
+    """
+    
+    remainder = opp_actions - opp_attacks - opp_switch
+    
+    # Opponent распределил remainder между shields и bonus
+    # Я узнаю shields только после resolution моего хода!
+    
+    # Для сейчас: prior distribution
+    for shields in range(0, remainder+1):
+        bonus = remainder - shields
+        P(shields, bonus) = prior(shields, bonus | opponent_type)
+После resolution МОЕГО хода:
+def update_belief_after_my_turn(observation):
+    """
+    observation:
+      - opp_shields_spent (те что opponent поставил на прошлом ходу)
+    """
+    
+    # Теперь я ТОЧНО ЗНАЮ сколько shields opponent поставил!
+    actual_shields = opp_shields_spent
+    actual_bonus = remainder - actual_shields
+    
+    # Update belief (posteror)
+    # Opponent оказался aggressive/defensive
+    # Обновляю prior для следующих ходов
+======================================================================
+ИТОГОВЫЙ QUERY INTERFACE
+======================================================================
+def query_nash_allocation(state, belief):
+    """
+    state: текущая позиция
+    belief: belief distribution по opponent shields/bonus
+    """
+    
+    # 1. Мои параметры (известны точно)
+    my_actions = state.my_actions
+    my_shields = state.my_shields
+    atd = attacks_to_kill(state.opp_char, state.my_char, my_shields)
+    
+    # 2. Opponent параметры (belief)
+    expected_atk = 0.0
+    for opp_shields, prob in belief.shields.items():
+        atk = attacks_to_kill(state.my_char, state.opp_char, opp_shields)
+        expected_atk += atk * prob
+    expected_atk = round(expected_atk)
+    
+    # 3. Opponent future actions (belief)
+    base_next = base_actions(state.turn + 2)  # его следующий ход
+    expected_bonus = sum(b * p for b, p in belief.bonus.items())
+    expected_opp_actions = base_next + round(expected_bonus)
+    expected_opp_actions = min(8, expected_opp_actions)
+    
+    # 4. Query
+    key = (expected_atk, atd, my_actions, expected_opp_actions)
+    
+    if key in nash_table:
+        return nash_table[key]
+    else:
+        # Fallback
+        return heuristic_allocation(expected_atk, atd, my_actions)
+======================================================================
+ВЫВОД
+======================================================================
+ТЫ ПРАВ: Я НЕ ЗНАЮ ни opponent shields, ни opponent bonus bank!
+Shields раскрываются только ПОСЛЕ resolution.
+Bonus раскрывается только когда opponent тратит его (через 2 хода).
+Поэтому нужен BELIEF TRACKER и query с expected values.
+Правильная таблица:
+  nash_table[(atk, atd, my_actions, opp_actions)]
+  5,184 записей (full) или 400-648 (bucketed)
+Хочешь начать с:
+  1. Belief tracker structure
+  2. Pre-compute script (для bucketed table, 400 entries)
+  3. Query interface с expected values

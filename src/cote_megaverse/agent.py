@@ -25,18 +25,32 @@ class PublicHistory:
 
     def observe(self, attacks: int, bonuses: int, switched: bool,
                 budget: int | None = None):
-        shields = None if budget is None else max(
-            0, budget - attacks - bonuses - int(switched))
-        self.actions.append((attacks, shields or 0, bonuses, int(switched)))
-        self.held_shields = shields
-        self.events.append(PublicEvent(attacks, bonuses, int(switched), shields))
-        self._update_policy(attacks, shields or 0, bonuses)
+        """Record one opponent allocation from PUBLIC facts only.
+
+        ``bonuses`` is the opponent's hidden split and is deliberately never
+        used: deriving a shield count from it (budget - attacks - bonuses)
+        would leak the exact hidden shields. What is public is the budget, the
+        attack count and a visible switch; the remainder (defends + bank) is
+        ambiguous until the resolution reveals the defender's shields.
+        """
+        if budget is None:
+            budget = attacks + int(switched)
+        remainder = max(0, budget - attacks - int(switched))
+        self.actions.append((attacks, remainder, 0, int(switched)))
+        self.held_shields = None
+        self.events.append(PublicEvent(attacks, 0, int(switched), None))
+        self._update_policy(attacks, remainder, 0)
 
     def observe_resolved(self, attacks, defends, bonuses, switched=False):
-        self.actions.append((attacks, defends, bonuses, int(switched)))
+        """Record a fully resolved allocation whose shields are already public.
+
+        ``bonuses`` remains hidden and is not recorded (the bank is only public
+        once spent, never from a single resolution).
+        """
+        self.actions.append((attacks, defends, 0, int(switched)))
         self.held_shields = defends
-        self.events.append(PublicEvent(attacks, bonuses, int(switched), defends))
-        self._update_policy(attacks, defends, bonuses)
+        self.events.append(PublicEvent(attacks, 0, int(switched), defends))
+        self._update_policy(attacks, defends, 0)
 
     def reveal_latest_defends(self, defends: int):
         if not self.actions:
@@ -99,21 +113,6 @@ class PublicEvent:
     switched: int
     resolved_shields: int | None = None
 
-    @property
-    def attack_rate(self):
-        total = sum(a + d + b for a, d, b, _ in self.actions)
-        return sum(a for a, _, _, _ in self.actions) / total if total else 1 / 3
-
-    @property
-    def defend_rate(self):
-        total = sum(a + d + b for a, d, b, _ in self.actions)
-        return sum(d for _, d, _, _ in self.actions) / total if total else 1 / 3
-
-    @property
-    def bonus_rate(self):
-        total = sum(a + d + b for a, d, b, _ in self.actions)
-        return sum(b for _, _, b, _ in self.actions) / total if total else 1 / 3
-
 
 @dataclass(frozen=True)
 class ShieldBelief:
@@ -161,7 +160,7 @@ class TacticalOutcome:
 
 class Planner:
     def __init__(self, depth=3, branch_limit=None, temperature=0.0, rng=None,
-                 band_fraction=0.15):
+                 band_fraction=0.15, max_nodes=2000):
         self.depth = depth
         self.branch_limit = branch_limit
         # Context-conditional mixing. 0 -> fully deterministic argmax (fast,
@@ -186,6 +185,13 @@ class Planner:
         # `_search`/`evaluate` call sites stay unchanged. It is public
         # inference, never a resolver read.
         self._believed_bank = 0
+        # Node budget for the depth-limited search. Late-game states with a
+        # large budget blow up (all legal allocations x shield worlds at every
+        # level); the budget cuts expansion deterministically (static eval),
+        # bounding worst-case choose() time without touching decisions in
+        # normal games.
+        self.max_nodes = max_nodes
+        self._nodes_used = 0
 
     def observe(self, attacks, bonuses=None, switched=False, budget=None,
                 turn=None):
@@ -394,6 +400,7 @@ class Planner:
         # banked burst invisible to the search.
         self._believed_bank = credible_bank
         self._search_cache.clear()
+        self._nodes_used = 0
         effective_depth = self.depth + (
             1 if state.player.alive_count + state.opponent.alive_count <= 3 else 0)
         belief = self.belief(state)
@@ -631,7 +638,36 @@ class Planner:
             return move.attacks * 1200 + move.bonuses * 700 - move.defends * 150
         return 0.0
 
-    def _search(self, state, depth, root_turn):
+    def _ordered_children(self, state, side, depth, is_max):
+        """Children ordered best-first for the side to move.
+
+        Ordering does not change the minimax value; it only lets alpha-beta
+        cut off early, which is what turns the freed node budget into depth.
+        The key is a CHEAP material proxy (HP difference + terminal flags), not
+        the full static eval: a full eval per child per node would cost as much
+        as alpha-beta saves.
+        """
+        children = []
+        for move in legal_allocations(side):
+            child = apply(state, move)
+            if child.opponent.lost:
+                key = 1e12
+            elif child.player.lost:
+                key = -1e12
+            else:
+                diff = (sum(c.hp for c in child.player.characters)
+                        - sum(c.hp for c in child.opponent.characters))
+                key = diff if is_max else -diff
+            children.append((key, move, child))
+        children.sort(key=lambda t: t[0], reverse=True)
+        return children
+
+    def _search(self, state, depth, root_turn, alpha=-1e18, beta=1e18):
+        self._nodes_used += 1
+        if self._nodes_used > self.max_nodes:
+            # Deterministic budget cutoff: stop expanding, use the static
+            # value. Only reached in pathological late-game states.
+            return self.evaluate(state, depth)
         key = (state, depth, root_turn)
         if key in self._search_cache:
             return self._search_cache[key]
@@ -639,27 +675,46 @@ class Planner:
             value = self.evaluate(state, depth)
             self._search_cache[key] = value
             return value
+        side = state.player if state.player_to_move else state.opponent
+        is_max = (state.player_to_move == root_turn)
+        children = self._ordered_children(state, side, depth, is_max)
         if depth <= 0:
-            terminal_values = [
-                self.evaluate(child, depth)
-                for move in legal_allocations(
-                    state.player if state.player_to_move else state.opponent)
-                if (child := apply(state, move)).player.lost or child.opponent.lost
-            ]
-            if terminal_values:
-                value = (max(terminal_values) if state.player_to_move
-                         else min(terminal_values))
-            else:
-                value = self.evaluate(state, depth)
+            terminal = None
+            for _, move, child in children:
+                if child.player.lost or child.opponent.lost:
+                    v = self.evaluate(child, depth)
+                    if terminal is None or (v > terminal if is_max else v < terminal):
+                        terminal = v
+            value = terminal if terminal is not None else self.evaluate(state, depth)
             self._search_cache[key] = value
             return value
-        values = []
-        side = state.player if state.player_to_move else state.opponent
-        for move in legal_allocations(side):
-            values.append(self._search(apply(state, move), depth - 1, root_turn))
-        value = ((max(values) if state.player_to_move == root_turn else min(values))
-                 if values else self.evaluate(state, depth))
-        self._search_cache[key] = value
+        cutoff = False
+        if is_max:
+            best = -1e18
+            for _, move, child in children:
+                v = self._search(child, depth - 1, root_turn, alpha, beta)
+                if v > best:
+                    best = v
+                if best > alpha:
+                    alpha = best
+                if alpha >= beta:
+                    cutoff = True
+                    break
+            value = best if best != -1e18 else self.evaluate(state, depth)
+        else:
+            best = 1e18
+            for _, move, child in children:
+                v = self._search(child, depth - 1, root_turn, alpha, beta)
+                if v < best:
+                    best = v
+                if best < beta:
+                    beta = best
+                if alpha >= beta:
+                    cutoff = True
+                    break
+            value = best if best != 1e18 else self.evaluate(state, depth)
+        if not cutoff:
+            self._search_cache[key] = value
         return value
 
     def evaluate(self, state, depth=0):

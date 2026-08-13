@@ -1,0 +1,318 @@
+======================================================================
+КАК СДЕЛАТЬ QUERY INTERFACE - РЕШЕНИЕ ПРОБЛЕМЫ РАЗМЕРА
+======================================================================
+ПРОБЛЕМА: 
+  Наивно: 100 миллионов уникальных 1v1 позиций
+  Невозможно pre-compute Nash для всех!
+======================================================================
+РЕШЕНИЕ: FEATURE-BASED APPROXIMATION ⭐ (РЕКОМЕНДУЮ)
+======================================================================
+КЛЮЧЕВОЕ НАБЛЮДЕНИЕ:
+Nash стратегия определяется НЕ точными HP/ATK значениями,
+а ПРОИЗВОДНЫМИ параметрами:
+1. ATK (Attacks To Kill) - сколько атак нужно чтобы убить противника
+2. ATD (Attacks To Die) - сколько атак противника убьют меня
+3. Available actions - сколько actions у меня
+4. Shields situation - мои/его shields
+ПРИМЕР:
+Позиция A:
+  my_hp=5700, my_atk=2000, opp_hp=6000, opp_atk=2000
+  -> ATK = ceil(6000 / (2000*1.0)) = 3
+  -> ATD = ceil(5700 / (2000*1.0)) = 3
+  
+Позиция B:
+  my_hp=5900, my_atk=1900, opp_hp=5800, opp_atk=2100
+  -> ATK = ceil(5800 / (1900*1.0)) = 4  (с округлением damage!)
+  -> ATD = ceil(5900 / (2100*1.0)) = 3
+  
+Позиции РАЗНЫЕ, но тактически ПОХОЖИЕ (ATK≈ATD≈3-4)
+-> Можно использовать похожие стратегии!
+======================================================================
+АРХИТЕКТУРА: NASH TABLE ПО (ATK, ATD, ACTIONS)
+======================================================================
+Вместо хранения 100M состояний, храним МАЛЕНЬКУЮ таблицу:
+nash_table: Dict[(atk, atd, actions), Strategy]
+Где:
+  atk ∈ [0..8]      # Attacks to kill opponent (9 значений)
+  atd ∈ [0..8]      # Attacks to die from opponent (9 значений)
+  actions ∈ [1..8]  # Available actions (8 значений)
+Размер таблицы:
+  9 × 9 × 8 = 648 записей
+Это КРОШЕЧНО! Легко pre-compute за несколько часов.
+======================================================================
+КАК РАБОТАЕТ QUERY
+======================================================================
+def query_nash_allocation(
+    my_char: Character,
+    opp_char: Character,
+    my_shields: int,
+    my_bonus: int,
+    opp_shields_belief: dict[int, float],  # Belief distribution
+    available_actions: int
+) -> Allocation:
+    """
+    Query Nash-optimal allocation for given state
+    """
+    
+    # 1. Вычисляем damage per attack (с учетом типа)
+    my_damage = exchange_damage(my_char, opp_char, attacks=1)
+    opp_damage_belief = {
+        s: exchange_damage(opp_char, my_char, attacks=1)
+        for s in opp_shields_belief.keys()
+    }
+    
+    # 2. Вычисляем ATK/ATD для каждого belief
+    # ATK учитывает opponent shields
+    atk_values = {}
+    for opp_shields, prob in opp_shields_belief.items():
+        # Сколько total attacks нужно (включая shields)
+        atk = attacks_to_kill(my_char, opp_char, shields=opp_shields)
+        if atk is None:
+            atk = 9  # Не можем убить за cap
+        atk_values[opp_shields] = (atk, prob)
+    
+    # ATD - сколько opponent нужно чтобы убить меня (я знаю свои shields)
+    atd = attacks_to_kill(opp_char, my_char, shields=my_shields)
+    if atd is None:
+        atd = 9
+    
+    # 3. Expected ATK (weighted average)
+    expected_atk = sum(atk * prob for atk, prob in atk_values.values())
+    expected_atk = round(expected_atk)  # Округляем до целого
+    
+    # 4. Lookup в Nash table
+    key = (expected_atk, atd, available_actions)
+    
+    if key in nash_table:
+        strategy = nash_table[key]
+        # Strategy - это mixed strategy (вероятности)
+        # Можем взять argmax (чисто exploit) или sample
+        return strategy.sample()
+    
+    # 5. Fallback: heuristic если нет в table
+    return heuristic_allocation(expected_atk, atd, available_actions)
+def heuristic_allocation(atk, atd, actions):
+    """
+    Fallback heuristic when no Nash solution available
+    """
+    
+    if atk <= actions:
+        # Можем убить этим ходом
+        if atd <= actions:
+            # Race condition - оба могут убить
+            # Приоритет: атаковать + немного защититься
+            return Allocation(attack=atk, defend=min(1, actions-atk), bonus=0)
+        else:
+            # Мы убиваем быстрее - full aggressive
+            return Allocation(attack=atk, defend=0, bonus=actions-atk)
+    
+    elif atd <= 3:
+        # Противник убивает быстро - нужна защита
+        defend = min(actions // 2, atd - 1)
+        return Allocation(attack=actions-defend, defend=defend, bonus=0)
+    
+    else:
+        # Long game - balance attack/defend
+        attack = actions // 2
+        defend = actions - attack
+        return Allocation(attack=attack, defend=defend, bonus=0)
+======================================================================
+КАК PRE-COMPUTE NASH TABLE
+======================================================================
+Для каждой комбинации (atk, atd, actions):
+1. Создать simplified 1v1 state с этими параметрами
+2. Запустить 1v1 CFR solver (уже есть!)
+3. Получить Nash equilibrium стратегию
+4. Сохранить в таблицу
+Псевдокод:
+nash_table = {}
+for atk in range(0, 9):
+    for atd in range(0, 9):
+        for actions in range(1, 9):
+            print(f"Computing Nash for (ATK={atk}, ATD={atd}, actions={actions})")
+            
+            # Создаем synthetic state с нужными ATK/ATD
+            # Подбираем HP так чтобы получить нужное atk/atd
+            my_hp = atd * 2000  # Грубо
+            opp_hp = atk * 2000
+            
+            # Создаем персонажей
+            my_char = Character(type=Type.A, hp=my_hp, atk=2000)
+            opp_char = Character(type=Type.A, hp=opp_hp, atk=2000)
+            
+            # Запускаем solver
+            solver = Solver1v1(
+                my_char, opp_char,
+                cap=atk + atd,  # Достаточная глубина
+                iterations=5000  # Меньше чем full convergence, но ok
+            )
+            solver.solve()
+            
+            # Извлекаем стратегию
+            strategy = solver.get_strategy_for(
+                my_hp, opp_hp, shields=0, bonus=0, actions=actions
+            )
+            
+            # Сохраняем
+            nash_table[(atk, atd, actions)] = strategy
+# Сохраняем на диск
+save_pickle("nash_table.pkl", nash_table)
+ВРЕМЯ:
+  648 позиций × 30 секунд = ~5.4 часа
+Это ONE-TIME cost! Потом просто загружаем таблицу.
+======================================================================
+REFINEMENTS: ЧТО ЕЩЕ УЧЕСТЬ
+======================================================================
+1. TYPE MULTIPLIER
+   ATK/ATD зависят от type matchup!
+   
+   Варианты:
+   
+   A) Включить multiplier в key:
+      key = (atk, atd, actions, multiplier)
+      Где multiplier ∈ {0.7, 1.0, 1.3}
+      
+      Размер: 648 × 3 = 1,944 записей
+      Время: ~16 часов pre-compute
+   
+   B) Вычислять ATK/ATD УЖЕ с учетом multiplier:
+      my_damage = atk * multiplier(my_type, opp_type)
+      atk = ceil(opp_hp / my_damage)
+      
+      Тогда multiplier already baked in!
+      НЕ нужен отдельный параметр.
+   
+   РЕКОМЕНДУЮ: Вариант B (simpler)
+2. TURN NUMBER
+   Ранние ходы (turn=1-2): меньше actions, другая тактика
+   Поздние ходы (turn=7+): больше actions
+   
+   НО: actions parameter уже учитывает это!
+   Turn=1 -> actions=1
+   Turn=7 -> actions=4
+   
+   НЕ нужен отдельный параметр.
+3. SHIELDS/BONUS
+   Текущие shields влияют на ATD (уже учтено в расчете)
+   Bonus влияет на available actions (уже учтено)
+   
+   НЕ нужны отдельные параметры.
+======================================================================
+АЛЬТЕРНАТИВА: УПРОЩЕННАЯ ТАБЛИЦА (ЕСЛИ 648 МНОГО)
+======================================================================
+Если даже 648 записей кажется много для pre-compute,
+можно сократить:
+REDUCED TABLE:
+  atk ∈ [0, 1, 2, 3, 4, 5+]   # 6 значений (5+ = не убиваем)
+  atd ∈ [0, 1, 2, 3, 4, 5+]   # 6 значений
+  actions ∈ [1, 2, 3, 4+]     # 4 значения (4+ = 4-8)
+Размер: 6 × 6 × 4 = 144 записей
+Время: ~1.2 часа
+Для промежуточных значений используем ближайший bucket.
+======================================================================
+ИТОГОВАЯ АРХИТЕКТУРА
+======================================================================
+┌─────────────────────────────────────────────────────────────────┐
+│ QUERY INTERFACE                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│ Input: my_char, opp_char, shields, bonus, actions, belief       │
+│   ↓                                                             │
+│ Derive: ATK, ATD (from HP, ATK, type multiplier, shields)       │
+│   ↓                                                             │
+│ Lookup: nash_table[(atk, atd, actions)]                         │
+│   ↓                                                             │
+│ Output: Allocation(attack=X, defend=Y, bonus=Z)                 │
+└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│ NASH TABLE (Pre-computed)                                       │
+├─────────────────────────────────────────────────────────────────┤
+│ 648 entries (or 144 reduced)                                    │
+│ Each entry: Nash equilibrium strategy                           │
+│ One-time cost: 5-16 hours                                       │
+│ Load time: <1 second                                            │
+│ Query time: <1 microsecond (dict lookup)                        │
+└─────────────────────────────────────────────────────────────────┘
+======================================================================
+ПРЕИМУЩЕСТВА ЭТОГО ПОДХОДА
+======================================================================
+✅ МАЛЕНЬКАЯ ТАБЛИЦА
+   648 записей вместо 100M состояний
+✅ БЫСТРЫЙ QUERY
+   Dict lookup = O(1) = <1μs
+✅ РАБОТАЕТ ДЛЯ ЛЮБЫХ HP/ATK
+   Через вычисление ATK/ATD
+✅ УЧИТЫВАЕТ TYPE MATCHUP
+   Через multiplier в расчете damage
+✅ ONE-TIME PRE-COMPUTE
+   5-16 часов один раз, потом instant
+✅ NASH ГАРАНТИИ
+   Каждая запись - точное Nash equilibrium
+✅ GRACEFUL DEGRADATION
+   Если нет в table -> fallback heuristic
+======================================================================
+НЕДОСТАТКИ И ОГРАНИЧЕНИЯ
+======================================================================
+❌ APPROXIMATION
+   Группируем разные HP в одинаковый ATK/ATD
+   Теряем тонкие boundary effects
+❌ PRE-COMPUTE TIME
+   Нужно 5-16 часов для создания таблицы
+❌ НЕ УЧИТЫВАЕТ ИСТОРИЮ
+   Только current state, не path dependency
+   (Но в 1v1 path dependency минимальна)
+======================================================================
+ПЛАН РЕАЛИЗАЦИИ
+======================================================================
+ШАГ 1: Создать simplified solver wrapper (1 день)
+  def solve_abstract_position(atk, atd, actions):
+      # Создать synthetic state
+      # Запустить 1v1 solver
+      # Вернуть Nash strategy
+      pass
+ШАГ 2: Pre-compute Nash table (5-16 часов runtime, 1 день work)
+  nash_table = {}
+  for atk, atd, actions in itertools.product(...):
+      nash_table[(atk, atd, actions)] = solve_abstract_position(...)
+  save_pickle("nash_table.pkl", nash_table)
+ШАГ 3: Query interface (1 день)
+  def query_nash_allocation(state):
+      atk, atd = derive_features(state)
+      return nash_table[(atk, atd, actions)]
+ШАГ 4: Fallback heuristic (1 день)
+  def heuristic_allocation(atk, atd, actions):
+      # Rule-based для missing entries
+      pass
+ШАГ 5: Integration testing (1-2 дня)
+  # Тесты на corner cases
+  # Benchmark query speed
+  # Validate Nash properties
+TOTAL: ~1 неделя работы + 5-16 часов compute
+======================================================================
+АЛЬТЕРНАТИВНЫЙ ПОДХОД: ЕСЛИ НУЖНО БЫСТРЕЕ
+======================================================================
+Если не хочешь ждать 5-16 часов pre-compute:
+PHASE 1: Pure heuristic (1 день)
+  - Только heuristic allocation
+  - Без Nash table
+  - Baseline для тестирования
+PHASE 2: Partial Nash table (2-3 часа)
+  - Pre-compute только критичные позиции
+  - Например: ATK,ATD ∈ [2..5], actions ∈ [2..4]
+  - ~100-200 записей
+  - Остальное - heuristic
+PHASE 3: Full Nash table (5-16 часов)
+  - Когда убедились что подход работает
+  - Full 648 entries
+======================================================================
+МОЯ РЕКОМЕНДАЦИЯ
+======================================================================
+1. Начать с HEURISTIC (1 день)
+   - Быстро, работает сразу
+   - Baseline для сравнения
+2. Pre-compute REDUCED table (1-2 часа)
+   - 144 entries вместо 648
+   - Покрывает основные случаи
+3. Тестировать и улучшать
+4. (Optional) Full table если нужно больше precision
+Хочешь, чтобы я начал имплементацию?
+Начнем с heuristic_allocation + query interface structure?

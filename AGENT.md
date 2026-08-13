@@ -431,9 +431,21 @@ current active, and never recommends a strictly worse switch.
 
 ### 10.1 Self-play and reference tools
 
-- `solve1v1.py` is an exact CFR-style equilibrium solver for a reduced 1v1
-  game (no switches, fixed stats). It is a laboratory for equilibrium values
-  and calibration, not part of the live bot.
+- `solver1v1.py` is the 1v1 GTO reference: hits-abstraction CFR on the
+  reachable DAG with the stall=loss draw rule. It is not part of the live bot.
+  Convergence is slow — the average strategy needs many iterations, and
+  exploitability must be measured with `info_set_br_value` (the
+  info-set-constrained best response); a naive per-state-max BR overstates and
+  misreports it.
+- `match_1v1.py` runs solver-vs-bot matches (1v1, both seats, W/L/D).
+- `botvbot.py` is a bot-vs-bot A/B driver (agent v3 vs the frozen v2 baseline);
+  `bot_selfplay.py` plays the current bot against itself (both seats, depth 1)
+  to measure first-mover advantage and draw rate at bot level.
+- The converged cap=8 1v1 equilibrium (173k iterations, ~5.6 h) is archived in
+  `artifacts/convergence_cap8/` (`checkpoint_final.pkl`, `final_results.txt`,
+  `convergence_log.txt`).
+- `strategy.py` and `agent.py` must remain human-fair; never reintroduce
+  resolver-state reads for opponent secrets.
 - `strategy.py` and `agent.py` must remain human-fair; never reintroduce
   resolver-state reads for opponent secrets.
 
@@ -523,6 +535,8 @@ Commands (all take `--run <name>` for per-session isolation):
 - `view` / `end` — show the state / finish and record the result.
 - `session --games N` — play N games back-to-back, each recorded
   automatically with a timestamp.
+- `stats --run <name>` — summarize the run's W/L/D and per-seat split (see
+  §12.2).
 - The state display includes a `-- history (public) --` section with the
   last turns' public outcomes (attacks, damage, revealed shields), so a player
   can read the opponent's patterns without remembering every line.
@@ -530,13 +544,12 @@ Commands (all take `--run <name>` for per-session isolation):
 Per-run isolation: state and logs live under `runs/<name>/` (`state.pkl`,
 `session_log.json`, `winrate_log.json`). Parallel sessions never collide.
 
-### 12.2 `track_winrate.py` — statistics
+### 12.2 Win-rate statistics
 
-`track_winrate.py add/show/reset [--run <name>]` records results and reports
-the human's win rate with a 95% Wilson confidence interval, per-seat splits,
-per-block (25) progress to expose learning curves, and advice on when the
-sample is large enough. `runs/<name>/winrate_log.json` is the source of truth
-for a session.
+`play.py stats --run <name>` reads `runs/<name>/winrate_log.json` and reports
+total W/L/D plus a per-seat split (ai_first vs human_first). `session` mode
+records a result automatically after each game. Sample guidance: ~100 games →
+±10%, ~200 → ±7%.
 
 ### 12.3 Subagent test subjects
 
@@ -554,16 +567,24 @@ these tests measure real strength against the same information a human sees.
 - `src/cote_megaverse/infoset.py`: opponent belief model (public-information
   shield/bank distribution).
 - `src/cote_megaverse/observation.py`: public observation boundary.
-- `src/cote_megaverse/agent.py`: planner — gates, scoring, mixing.
+- `src/cote_megaverse/agent.py`: planner — gates, scoring, mixing (current bot).
+- `src/cote_megaverse/agent_v2.py`: frozen previous-generation planner, used
+  only as the `botvbot.py` A/B baseline.
 - `src/cote_megaverse/strategy.py`: objectives and switch valuation.
 - `src/cote_megaverse/interactive.py`: human-fair terminal game and display
   contract.
-- `src/cote_megaverse/benchmark.py`: seeded fair self-play, analysis, replay.
-- `src/cote_megaverse/solve1v1.py`: exact 1v1 equilibrium solver (laboratory).
+- `src/cote_megaverse/benchmark.py`: seeded fair self-play, analysis, replay
+  (`benchmark_policies`, `run_match`, `run_self_play`).
+- `src/cote_megaverse/solver1v1.py`: 1v1 equilibrium solver — CFR on the
+  reachable DAG with an HP→hits-to-kill abstraction and the stall=loss draw
+  rule (see §10.1). `solve1v1.py` is the earlier laboratory solver, kept for
+  reference only.
+- `src/cote_megaverse/match_1v1.py`: solver-vs-bot match harness (1v1, W/L/D,
+  both seats; maps abstracted hits to representative real HP for the bot).
 - `src/cote_megaverse/cli.py`: position-analysis entry point.
-- `play.py`, `track_winrate.py`: harness and statistics (see above).
-- `run_baseline.py`: parallel benchmark runner (`--seeds --limit --workers`).
-- `run_exploit.py`: bot win rate vs the shield-reading "reader" policy.
+- `play.py`: game harness (`new/move/view/end/session/stats`). `botvbot.py`:
+  bot-vs-bot A/B driver. `bot_selfplay.py`: bot-vs-itself first-mover
+  measurement.
 - `tests/test_new_engine.py`, `tests/test_layers.py`,
   `tests/test_interactive.py`: rules, fairness, strategy, benchmark, and
   terminal-visibility tests.
@@ -580,31 +601,35 @@ UI:
 python -m unittest discover -s tests -p "test_*.py" -v
 python -m src.cote_megaverse.interactive
 python -m src.cote_megaverse.cli --team A,B,C --opponent B,C,C --depth 3
-python -m py_compile src/cote_megaverse/rules.py src/cote_megaverse/agent.py src/cote_megaverse/observation.py src/cote_megaverse/interactive.py src/cote_megaverse/benchmark.py src/cote_megaverse/cli.py src/cote_megaverse/infoset.py src/cote_megaverse/solve1v1.py
+python -m py_compile src/cote_megaverse/rules.py src/cote_megaverse/agent.py src/cote_megaverse/observation.py src/cote_megaverse/interactive.py src/cote_megaverse/benchmark.py src/cote_megaverse/cli.py src/cote_megaverse/infoset.py src/cote_megaverse/solver1v1.py
 git diff --check
 ```
 
-Run a seeded AI-vs-human-policy baseline, in parallel on `N` cores:
+Run a seeded AI-vs-human-policy baseline with the benchmark policies
+(`random`, `greedy`, `bonus_shield`; every seed once per seat) and the exploit
+policies `reader` (predicts the bot's shields) and `burster` (bank-and-burst)
+to verify a change closes the hole a strong human exploited:
 
 ```powershell
 python run_baseline.py --seeds 100 --limit 100 --workers 16 --out after_bench.txt
 ```
 
-Do NOT run it through `python -c "..."`: on Windows multiprocessing uses spawn
-and needs a file-based `__main__`, so `python -c` cannot parallelize. The
-bundled policies are `random`, `greedy`, and `bonus_shield`; every seed is
-played once with the human policy first and once with AI first. `benchmark.py`
-also defines the exploit policies `reader` (predicts the bot's shields) and
-`burster` (bank-and-burst) — use them to verify a change actually closes the
-hole a strong human exploited. Do not interpret self-play win rate as human
-win rate. Record wins, losses, draws, missed guaranteed lethals, and
-guaranteed-loss moves separately.
+Do NOT parallelize with multiprocessing through `python -c "..."`: on Windows
+spawn needs a file-based `__main__`, so drive it through `run_baseline.py`.
+Do not interpret self-play win rate as human win rate. Record wins, losses,
+draws, missed guaranteed lethals, and guaranteed-loss moves separately.
 
 Evaluate against human-like play with the harness:
 
 ```powershell
 python play.py session --games 20 --temp 0.12
-python track_winrate.py show
+python play.py stats --run default
+```
+
+Measure bot-level first-mover balance (bot vs itself, both seats):
+
+```powershell
+python bot_selfplay.py 40 8
 ```
 
 Do not reintroduce genome evolution, LSTM/NumPy/Numba legacy planners, legacy
@@ -629,15 +654,38 @@ are caught:
 - The harness and bot revealed the opponent's shields only on attack. Shields
   are now revealed on every resolution, symmetrically for human and AI
   (see §8).
-- The `PublicEvent` rate properties reference a nonexistent field and are dead
-  code.
+- The `PublicEvent` rate properties referenced a nonexistent field and were
+  dead code; they have been removed.
+- `PublicHistory.observe` derived the opponent's exact shield count from the
+  hidden bonuses the harness passed (budget - attacks - bonuses), leaking the
+  current shields to the decision one turn early. It now records only public
+  facts (attacks, budget, switch, remainder) and learns shields only from the
+  per-resolution reveal. `observe_resolved` likewise never records bonuses.
 
 Items that remain open (not bugs, but known engineering debt):
 
-- `PublicHistory` still derives an exact shield count from the opponent's true
-  bonuses; the fair belief path is `OpponentModel`, and `PublicHistory` is
-  kept for behavioural policy estimates. Do not let the derived value leak into
-  `Planner.belief()`.
 - The heuristic scoring terms are hand-tuned and overlapping; they are the
   calibration target if a principled utility replaces them.
-- `solve1v1.py` is a working laboratory but not a converged full-game solver.
+- The 1v1 equilibrium solver is `solver1v1.py` (hits-abstraction CFR); its
+  average strategy needs many iterations to converge, and exploitability must
+  use the info-set-constrained best response (`info_set_br_value`).
+  `solve1v1.py` is kept as the original laboratory.
+
+Measured facts (do not re-derive blindly):
+
+- **First-mover advantage in the full game is NOT the 1v1 GTO 69/31.** The
+  1v1 equilibrium value is +0.30 for the first mover (≈69% of decided games)
+  and the converged opening is ~99% a1/d0/b0 — but that is the *endgame*
+  tempo effect, not the full-game balance. Symmetric full-game measurements:
+  random-vs-random favors the second mover (≈44/56), greedy-vs-greedy favors
+  the first (≈59/41), and bot-vs-bot (depth 1) is ~95% draws. Net: the full
+  game is roughly balanced (≈50/50) and buffing the second player on the basis
+  of the 1v1 number would likely over-buff. Decide a definition of "balance"
+  (casual vs strong play) before changing anything.
+- **Bot-vs-bot self-play at depth 1 is dominated by draws** (~95%), which
+  makes it a weak signal for first-mover balance; the wall/defensive tendency
+  must be addressed before self-play is informative. One bot game ≈ 0.28 s per
+  ply, ~28 s/game, ~4.6 min for 80 games on 8 workers.
+- The converged cap=8 1v1 run (173k iterations, ~5.6 h, explo ≈0.068/0.053)
+  is archived under `artifacts/convergence_cap8/`; treat further multi-hour
+  solver runs as high-cost and avoid repeating them casually.

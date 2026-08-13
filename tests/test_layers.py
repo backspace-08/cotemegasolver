@@ -33,9 +33,11 @@ class LayerTests(unittest.TestCase):
     def test_planner_only_learns_resolved_shields(self):
         planner = Planner(depth=1)
         planner.observe(attacks=1, bonuses=2, switched=False)
-        self.assertEqual(planner.history.actions[-1], (1, 0, 2, 0))
+        # The hidden bonuses must not be stored or used to derive exact shields:
+        # the record holds the public remainder (0) and zero bonuses.
+        self.assertEqual(planner.history.actions[-1], (1, 0, 0, 0))
         planner.observe_shields(3)
-        self.assertEqual(planner.history.actions[-1], (1, 3, 2, 0))
+        self.assertEqual(planner.history.actions[-1], (1, 3, 0, 0))
 
     def test_public_budget_yields_a_remainder_not_an_exact_shield_count(self):
         # Budget 5 with 3 public attacks leaves a remainder of 2. That remainder

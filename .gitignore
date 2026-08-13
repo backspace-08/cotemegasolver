@@ -18,3 +18,6 @@ runs/
 after_bench.txt
 baseline_*.txt
 *_bench.txt
+
+# Server test output (checkpoints, trajectories, pool)
+server_out/
