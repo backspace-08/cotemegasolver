@@ -48,7 +48,7 @@ class BotPolicy:
         self.rng = random.Random(seed)
 
     def _planning(self, st):
-        hA, hB, bankA, bankB, shA, shB, stA, stB, turn, to_move = st
+        hA, hB, bankA, bankB, shA, shB, turn, to_move = st
         if self.is_A:
             bot_hits, bot_bank, bot_sh = hA, bankA, shA
             opp_hits, opp_bank, opp_sh = hB, bankB, shB
@@ -81,7 +81,7 @@ class BotPolicy:
         return (move.attacks, move.defends, move.bonuses)
 
     def observe_solver_move(self, st, act):
-        hA, hB, bankA, bankB, shA, shB, stA, stB, turn, to_move = st
+        hA, hB, bankA, bankB, shA, shB, turn, to_move = st
         a, d, b = act
         from .solver1v1 import base as _b
         opp_budget = min(8, _b(turn) + (bankB if self.is_A else bankA))
@@ -120,11 +120,11 @@ def play_match(solver, seat, seed=0, verbose=False, mode="bot",
         if t is not None:
             return t, plies
         before = st
-        act = (polA if st[9] == 0 else polB).act(st)
+        act = (polA if st[7] == 0 else polB).act(st)
         if verbose:
-            print(f"  T{st[8]} {'A' if st[9]==0 else 'B'} a{act[0]}/d{act[1]}/b{act[2]} "
+            print(f"  T{st[6]} {'A' if st[7]==0 else 'B'} a{act[0]}/d{act[1]}/b{act[2]} "
                   f"hitsA={st[0]} hitsB={st[1]}", flush=True)
-        acting = 0 if st[9] == 0 else 1
+        acting = 0 if st[7] == 0 else 1
         if mode == "self":
             pass  # no bot observations needed
         elif acting == bot_pol_index:
