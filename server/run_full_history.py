@@ -9,17 +9,27 @@ approximation the bot would play from.
 Usage (Linux, run from the repo root; BLAS threads are pinned to 1):
     python server/run_full_history.py --cap 6 --hp 10000 --iters 600 --report-every 100
     python server/run_full_history.py --cap 6 --iters 400 --resume
+    # dump the per-state equilibrium value table from an existing checkpoint
+    # (loads it, runs nothing, ~30-60s):
+    python server/run_full_history.py --cap 6 --hp 10000 --iters 1400 --resume --dump-value
 
 Measured (cap=6 hp=10000, full history): build ~10s, ~0.4 it/s on 1 core,
 expl 0.67@50 -> 0.09@100 -> ~0.05@300. Practical target ~0.01 needs ~500-600
 iterations (~20-25 min on 1 core). Iteration is memory-bound; more threads do
 not help a single run.
+
+The value table (--dump-value) writes one row per DISTINCT abstract state
+(hA,hB,bankA,bankB,shA,shB,turn,to_move), deduplicated across the tree's
+transpositions, and reports the max value spread per state (values should be
+path-independent; a large spread flags a caveat for the 2v2/3v3 layer).
 """
 import argparse
 import os
 import pickle
 import sys
 import time
+
+import numpy as np
 
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
@@ -47,6 +57,50 @@ def save_checkpoint(s, path):
                 open(path, "wb"))
 
 
+def dump_value_table(s, path):
+    """Per-DISTINCT-abstract-state equilibrium values of the average profile.
+
+    Vectorized backward pass over the tree (same math as profile_value but
+    per node), then one row per unique (hA,hB,bankA,bankB,shA,shB,turn,to_move)
+    state. Returns (distinct_count, max_spread) where max_spread is the largest
+    |value| difference seen across transpositions of the same abstract state
+    (should be ~0; a large value flags that the value is path-dependent, which
+    matters for how the 2v2/3v3 layer consumes the table).
+    """
+    n = s.n_states
+    v = np.array(s.term_arr, dtype=np.float64)
+    tot = s.avg.sum(axis=1, keepdims=True)
+    nv = np.maximum(s.n_acts_info, 1)[:, None]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        avgn = np.where(tot > 0, s.avg / tot, 1.0 / nv)
+    for data in reversed(s._value_data):
+        if data is None:
+            continue
+        nt, cp, mask = data
+        vc = np.where(mask, v[np.where(mask, cp, 0)], 0.0)
+        sa = avgn[s.info_id[nt]]
+        v[nt] = s.gamma * (sa * vc).sum(axis=1)
+    seen = {}
+    with open(path, "w") as fh:
+        fh.write("hA,hB,bankA,bankB,shA,shB,turn,to_move,value\n")
+        for i in range(n):
+            if s.term[i] is not None:
+                continue
+            st = s.states[i]
+            key = st
+            vi = float(v[i])
+            if key in seen:
+                seen[key][0] = min(seen[key][0], vi)
+                seen[key][1] = max(seen[key][1], vi)
+                continue
+            seen[key] = [vi, vi]
+            fh.write("%d,%d,%d,%d,%d,%d,%d,%d,%.6f\n"
+                     % (st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7],
+                        vi))
+    spread = max(hi - lo for lo, hi in seen.values()) if seen else 0.0
+    return len(seen), spread
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cap", type=int, default=6)
@@ -56,6 +110,7 @@ def main():
     ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--out", default="server_out_fh")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--dump-value", action="store_true")
     a = ap.parse_args()
 
     os.makedirs(a.out, exist_ok=True)
@@ -111,6 +166,14 @@ def main():
     print("checkpoint (equilibrium avg/regret): %s" % ckpt, flush=True)
     print("trajectory: %s" % os.path.join(a.out, "traj_fh_cap%d.csv" % a.cap),
           flush=True)
+
+    if a.dump_value:
+        t1 = time.time()
+        vpath = os.path.join(a.out, "value_table_fh_cap%d.csv" % a.cap)
+        n_states, spread = dump_value_table(s, vpath)
+        print("value table: %d distinct states -> %s (%.1fs); "
+              "max value spread per state=%.4f"
+              % (n_states, vpath, time.time() - t1, spread), flush=True)
     print("done", flush=True)
 
 
