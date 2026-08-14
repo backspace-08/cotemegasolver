@@ -25,3 +25,12 @@ server_out/
 # Rust build artifacts
 cote_cfr/target/
 cote_cfr/Cargo.lock
+
+table_out/*.log
+table_out/*.err
+
+
+server_out_fh/
+table_out/*.json
+table_out/summary.csv
+

@@ -55,13 +55,15 @@ def _encode_state(state, opp_bank, opp_sh):
 
 class CFRBot:
     def __init__(self, depth=3, iters=200, cap=6, gamma=0.995,
-                 temperature=0.0, rng=None):
+                 temperature=0.0, rng=None, value_leaf=None):
         self.depth = depth
         self.iters = iters
         self.cap = cap
         self.gamma = gamma
         self.temperature = temperature
         self.rng = rng
+        # optional belief-conditioned value network for the leaves (ReBeL/DeepStack)
+        self.value_leaf = value_leaf
         self.model = OpponentModel()
         self._observed_turns = 0
         self.last_report = {}
@@ -85,13 +87,23 @@ class CFRBot:
     def choose(self, state) -> Allocation:
         state = _masked(state)
         worlds = self.model.worlds() or (WorldProxy(0, 0, 1.0),)
-        roots = [(_encode_state(state, w.bank, w.shields), w.probability)
-                 for w in worlds]
         team_a = _team_of(state.player)
         team_b = _team_of(state.opponent)
-        actions, probs, value = _cote_cfr.solve_micro_belief(
-            team_a, team_b, roots, depth=self.depth, iters=self.iters,
-            gamma=self.gamma, cap=self.cap, start_turn=state.turn)
+        roots = [(_encode_state(state, w.bank, w.shields), w.probability)
+                 for w in worlds]
+        mt = _cote_cfr.MicroTree(team_a, team_b, roots, depth=self.depth,
+                                 cap=self.cap, start_turn=state.turn)
+        override = []
+        if self.value_leaf is not None:
+            leaves = mt.leaf_states()
+            r_opp = worlds[0].shields + worlds[0].bank
+            belief_vec = [0.0] * (r_opp + 1)
+            for w in worlds:
+                belief_vec[w.shields] += w.probability
+            override = self.value_leaf.override(team_a, team_b, leaves,
+                                                belief_vec, bot_side=0)
+        mt.solve(self.iters, self.gamma, override)
+        actions, probs, value = mt.strategy()
         idx = _pick(probs, self.temperature, self.rng)
         a, d, b, sw = actions[idx]
         self.last_report = {

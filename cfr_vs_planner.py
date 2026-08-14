@@ -22,34 +22,45 @@ from cote_megaverse.cfr_bot import CFRBot  # noqa: E402
 
 
 def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
-              pl_depth, pl_max_nodes):
+              pl_depth, pl_max_nodes, net=None):
     rng = random.Random(seed)
     types = list(Type)
     state = initial(tuple(rng.choice(types) for _ in range(3)),
                     tuple(rng.choice(types) for _ in range(3)), rng=rng)
     if not new_first:
         state = replace(state, player_to_move=False).prepare()
-    cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap)
+    value_leaf = None
+    if net:
+        from server.value_leaf import ValueLeaf
+        value_leaf = ValueLeaf(net)
+    cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap,
+                 value_leaf=value_leaf)
     pl = Planner(depth=pl_depth, max_nodes=pl_max_nodes)
-    for _ in range(80):
-        if state.player.lost or state.opponent.lost:
-            break
-        if state.player_to_move:
-            before = state
-            planning = GameState(state.player, state.opponent, state.turn, True)
-            move = cfr.choose(planning)
-            state = apply(state, move)
-            pl.observe(move.attacks, move.bonuses, move.switch,
-                       budget=before.player.actions)
-            pl.observe_shields(before.player.shields)
-        else:
-            before = state
-            planning = GameState(state.opponent, state.player, state.turn, True)
-            move = pl.choose(planning)
-            state = apply(state, move)
-            cfr.observe(move.attacks, move.bonuses, move.switch,
-                        budget=before.opponent.actions)
-            cfr.observe_shields(before.opponent.shields)
+    try:
+        for _ in range(80):
+            if state.player.lost or state.opponent.lost:
+                break
+            if state.player_to_move:
+                before = state
+                planning = GameState(state.player, state.opponent, state.turn, True)
+                move = cfr.choose(planning)
+                state = apply(state, move)
+                pl.observe(move.attacks, move.bonuses, move.switch,
+                           budget=before.player.actions)
+                pl.observe_shields(before.player.shields)
+            else:
+                before = state
+                planning = GameState(state.opponent, state.player, state.turn, True)
+                move = pl.choose(planning)
+                state = apply(state, move)
+                cfr.observe(move.attacks, move.bonuses, move.switch,
+                            budget=before.opponent.actions)
+                cfr.observe_shields(before.opponent.shields)
+    except Exception:
+        import traceback
+        with open(os.path.join(BASE, "table_out", "worker_err.log"), "w") as fh:
+            traceback.print_exc(file=fh)
+        raise
     if state.opponent.lost:
         return {"seed": seed, "new_first": new_first, "winner": "LEFT"}
     if state.player.lost:
@@ -58,9 +69,9 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
 
 
 def _worker(task):
-    seed, new_first, cfr_depth, cfr_iters, cfr_cap, pl_depth, pl_max_nodes = task
+    seed, new_first, cfr_depth, cfr_iters, cfr_cap, pl_depth, pl_max_nodes, net = task
     return run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
-                     pl_depth, pl_max_nodes)
+                     pl_depth, pl_max_nodes, net)
 
 
 def main():
@@ -73,10 +84,11 @@ def main():
     ap.add_argument("--pl-depth", type=int, default=2)
     ap.add_argument("--pl-max-nodes", type=int, default=2000)
     ap.add_argument("--seed-start", type=int, default=1100)
+    ap.add_argument("--net", default=None, help="value-network .pt for leaves")
     ap.add_argument("--tag", default="cfr_vs_planner")
     a = ap.parse_args()
     tasks = [(a.seed_start + i, (i % 2 == 0), a.cfr_depth, a.cfr_iters,
-              a.cfr_cap, a.pl_depth, a.pl_max_nodes) for i in range(a.games)]
+              a.cfr_cap, a.pl_depth, a.pl_max_nodes, a.net) for i in range(a.games)]
     with Pool(a.workers) as pool:
         results = list(pool.imap_unordered(_worker, tasks))
     out = os.path.join(BASE, "runs", "botvbot", f"{a.tag}.json")

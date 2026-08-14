@@ -335,6 +335,7 @@ struct MicroSolver {
     infos: Vec<InfoSet>,
     tm_of: Vec<u8>,
     keep: HashMap<(u8, Vec<i32>), Vec<bool>>,
+    leaf_override: HashMap<Vec<i32>, f64>,
     r_a: Vec<f64>,
     r_b: Vec<f64>,
     v: Vec<f64>,
@@ -362,6 +363,7 @@ impl MicroSolver {
             infos: Vec::new(),
             tm_of: Vec::new(),
             keep: HashMap::new(),
+            leaf_override: HashMap::new(),
             r_a: Vec::new(),
             r_b: Vec::new(),
             v: Vec::new(),
@@ -482,6 +484,12 @@ impl MicroSolver {
         }
         if s.order_b.is_empty() {
             return 1.0;
+        }
+        // Learned (belief-conditioned) value injected from Python: exact-HP
+        // 2v2/3v3 leaves are evaluated by the value network, keyed by the
+        // flat state encoding.
+        if let Some(&v) = self.leaf_override.get(&encode_state(s)) {
+            return v;
         }
         // Exact 1v1 value when the game has reduced to a duel (one char each).
         if s.order_a.len() == 1 && s.order_b.len() == 1 {
@@ -884,6 +892,91 @@ fn solve_micro_belief(
     solve_micro_impl(team_a, team_b, states, depth, iters, gamma, cap, start_turn, prune)
 }
 
+/// Depth-limited subgame solver with pluggable leaf values: the leaves are
+/// exposed to Python so a value network can evaluate them, then `solve` runs
+/// CFR with those learned values (belief-conditioned, DeepStack/ReBeL style).
+#[pyclass]
+struct MicroTree {
+    inner: MicroSolver,
+}
+
+#[pymethods]
+impl MicroTree {
+    #[new]
+    #[pyo3(signature = (team_a, team_b, states, depth=3, cap=6, start_turn=1))]
+    fn new(
+        team_a: Vec<(u8, i32, i32)>,
+        team_b: Vec<(u8, i32, i32)>,
+        states: Vec<(Vec<i32>, f64)>,
+        depth: u8,
+        cap: i32,
+        start_turn: i32,
+    ) -> PyResult<Self> {
+        let mut roots = Vec::with_capacity(states.len());
+        let mut wsum = 0.0;
+        for (raw, w) in states {
+            roots.push((decode_state(&raw)?, w));
+            wsum += w;
+        }
+        if roots.is_empty() {
+            return Err(PyValueError::new_err("no root states"));
+        }
+        if wsum <= 0.0 {
+            return Err(PyValueError::new_err("root weights must sum to > 0"));
+        }
+        for (_, w) in roots.iter_mut() {
+            *w /= wsum;
+        }
+        let trunk = Trunk::new(team_a, team_b, cap, start_turn);
+        Ok(MicroTree { inner: MicroSolver::new(trunk, roots, depth, 0.995) })
+    }
+
+    fn node_count(&self) -> usize {
+        self.inner.states.len()
+    }
+
+    /// Flat-encoded states of all depth-limited non-terminal leaves (the nodes
+    /// whose value the search would need). 1v1 leaves are excluded here: the
+    /// engine's exact table already covers them.
+    fn leaf_states(&self) -> Vec<Vec<i32>> {
+        let n = self.inner.states.len();
+        let depth = self.inner.depth;
+        let mut out = Vec::new();
+        for i in 0..n {
+            if self.inner.depths[i] == depth && self.inner.terminals[i].is_none() {
+                let s = &self.inner.states[i];
+                if s.order_a.len() > 1 || s.order_b.len() > 1 {
+                    out.push(encode_state(s));
+                }
+            }
+        }
+        out
+    }
+
+    /// Run CFR with the given leaf values (flat state -> value).
+    #[pyo3(signature = (iters, gamma=0.995, override_=vec![]))]
+    fn solve(&mut self, iters: usize, gamma: f64, override_: Vec<(Vec<i32>, f64)>) {
+        self.inner.gamma = gamma;
+        self.inner.leaf_override.clear();
+        for (k, v) in override_ {
+            self.inner.leaf_override.insert(k, v);
+        }
+        for _ in 0..iters {
+            self.inner.iterate();
+        }
+    }
+
+    fn strategy(&self) -> (Vec<Vec<i32>>, Vec<f64>, f64) {
+        let acts = &self.inner.actions_of[self.inner.roots[0].0];
+        let (probs, value) = self.inner.root_strategy();
+        let actions: Vec<Vec<i32>> = acts
+            .iter()
+            .map(|ac| vec![ac.a, ac.d, ac.b, ac.sw.map(|x| x as i32).unwrap_or(-1)])
+            .collect();
+        (actions, probs, value)
+    }
+}
+
 /// Build the micro-tree without iterating; returns (n_nodes, n_infos).
 #[pyfunction]
 #[pyo3(signature = (team_a, team_b, state, depth=4, cap=20, start_turn=1))]
@@ -939,6 +1032,7 @@ fn load_1v1_table(path: String) -> PyResult<usize> {
 #[pymodule]
 fn _cote_cfr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTrunk>()?;
+    m.add_class::<MicroTree>()?;
     m.add_function(wrap_pyfunction!(solve_micro, m)?)?;
     m.add_function(wrap_pyfunction!(solve_micro_belief, m)?)?;
     m.add_function(wrap_pyfunction!(micro_stats, m)?)?;
