@@ -505,11 +505,14 @@ impl MicroSolver {
                 }
             }
         }
-        // Material fallback (2v2/3v3 leaves or a table miss).
+        // Material fallback (2v2/3v3 leaves or a table miss). Bodies are the
+        // decisive quantity in 3v3 (a one-body lead is nearly a win), so they
+        // outweigh the HP term: an EV-neutral body-for-body trade must not look
+        // like standing still, or CFR retreats into a shield turtle.
         let ha: i32 = s.hp_a.iter().sum();
         let hb: i32 = s.hp_b.iter().sum();
         let material = (ha - hb) as f64 / 6000.0;
-        let bodies = (s.order_a.len() as f64 - s.order_b.len() as f64) * 0.15;
+        let bodies = (s.order_a.len() as f64 - s.order_b.len() as f64) * 0.35;
         (material + bodies).clamp(-1.0, 1.0)
     }
 
