@@ -55,7 +55,7 @@ def base_budget(turn: int) -> int:
     return min(TURN_ACTIONS.get(turn, 4), 4)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Character:
     type: Type
     hp: int = BASE_HP
@@ -67,7 +67,7 @@ class Character:
         return self.hp > 0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Side:
     characters: tuple[Character, ...]
     active: int = 0
@@ -99,7 +99,7 @@ def next_budget(turn: int, side: Side) -> int:
     return min(MAX_ACTIONS, base_budget(turn) + side.bonus)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class GameState:
     player: Side
     opponent: Side
@@ -117,7 +117,7 @@ class GameState:
         return replace(self, opponent=prepared)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Allocation:
     attacks: int
     defends: int
@@ -206,8 +206,8 @@ def apply(state: GameState, allocation: Allocation) -> GameState:
                          stack_order=tuple(target_order),
                          shields=0, forced_promotion=forced)
     if state.player_to_move:
-        return replace(GameState(new_actor, new_target, state.turn + 1, False)).prepare()
-    return replace(GameState(new_target, new_actor, state.turn + 1, True)).prepare()
+        return GameState(new_actor, new_target, state.turn + 1, False).prepare()
+    return GameState(new_target, new_actor, state.turn + 1, True).prepare()
 
 
 def initial(player: Iterable[Type], opponent: Iterable[Type], rng: Random | None = None) -> GameState:

@@ -14,7 +14,7 @@ import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(BASE, "..", ".."))
-_TABLE = os.path.join(_REPO, "cote_cfr", "1v1_table_cap6.csv")
+_TABLE = os.path.join(_REPO, "cote_cfr", "1v1_table.csv")
 
 import _cote_cfr  # noqa: E402
 

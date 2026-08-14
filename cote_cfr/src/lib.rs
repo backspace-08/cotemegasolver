@@ -124,6 +124,7 @@ fn encode_state(s: &State) -> Vec<i32> {
     out
 }
 
+#[derive(Clone)]
 struct Trunk {
     team_a: Vec<(u8, i32, i32)>, // (type, atk, max_hp_units)
     team_b: Vec<(u8, i32, i32)>,
@@ -280,16 +281,95 @@ impl Trunk {
 // crosses the PyO3 boundary.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
-/// Canonical-belief 1v1 value table: (hA,hB,bankA,bankB,shA,shB,turn,to_move) -> value.
-/// Loaded once per process from `server/export_1v1_table.py`. Values are the
-/// equilibrium-belief 1v1 values (belief-dependence is a known limitation).
-type VKey = (i32, i32, i32, i32, i32, i32, i32, i32);
+/// Canonical-belief 1v1 value table, belief-key format:
+/// (hA, hB, to_move, own_bank, own_sh, R, turn) -> value, where (own_bank,
+/// own_sh) is the ACTING player's own known split and R = opponent sh + bank
+/// (public remainder). turn >= 7 is clamped to 7 (stationary phase 4).
+/// Values are the equilibrium-belief 1v1 values (belief-dependence known).
+type VKey = (i32, i32, i32, i32, i32, i32, i32);
 static V1_TABLE: OnceLock<Mutex<HashMap<VKey, f64>>> = OnceLock::new();
 
 fn v1_table() -> &'static Mutex<HashMap<VKey, f64>> {
     V1_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Layout of the dense belief-state grid used by the 1v1 table builder.
+/// A belief-state is (hA, hB, to_move, own_bank, own_sh, R); the value is the
+/// belief-root equilibrium value over the opponent's (bank, sh) splits of R.
+#[derive(Clone, Copy)]
+struct V1Layout {
+    hits_min: usize,
+    hits_max: usize,
+    bank_max: usize,
+    sh_max: usize,
+    r_max: usize,
+}
+
+impl V1Layout {
+    fn nh(&self) -> usize {
+        self.hits_max - self.hits_min + 1
+    }
+    fn nb(&self) -> usize {
+        self.bank_max + 1
+    }
+    fn nsh(&self) -> usize {
+        self.sh_max + 1
+    }
+    fn nr(&self) -> usize {
+        self.r_max + 1
+    }
+    fn size(&self) -> usize {
+        self.nh() * self.nh() * 2 * self.nb() * self.nsh() * self.nr()
+    }
+    fn index(&self, hA: i32, hB: i32, mv: i32, bank: i32, sh: i32, r: i32) -> Option<usize> {
+        if !(self.hits_min as i32..=self.hits_max as i32).contains(&hA) {
+            return None;
+        }
+        if !(self.hits_min as i32..=self.hits_max as i32).contains(&hB) {
+            return None;
+        }
+        if !(0..=self.bank_max as i32).contains(&bank) {
+            return None;
+        }
+        if !(0..=self.sh_max as i32).contains(&sh) {
+            return None;
+        }
+        if !(0..=self.r_max as i32).contains(&r) {
+            return None;
+        }
+        if !(0..=1).contains(&mv) {
+            return None;
+        }
+        let nh = self.nh();
+        let (hA, hB, mv, bank, sh, r) =
+            (hA as usize, hB as usize, mv as usize, bank as usize, sh as usize, r as usize);
+        let idx = ((((hA - self.hits_min) * nh + (hB - self.hits_min)) * 2 + mv) * self.nb() + bank)
+            * self.nsh()
+            + sh;
+        Some(idx * self.nr() + r)
+    }
+    /// Decode a flat index into (hA, hB, to_move, own_bank, own_sh, R).
+    fn decode(&self, i: usize) -> Option<(i32, i32, i32, i32, i32, i32)> {
+        if i >= self.size() {
+            return None;
+        }
+        let mut x = i;
+        let r = x % self.nr();
+        x /= self.nr();
+        let sh = x % self.nsh();
+        x /= self.nsh();
+        let bk = x % self.nb();
+        x /= self.nb();
+        let mv = x % 2;
+        x /= 2;
+        let hb = x % self.nh() + self.hits_min;
+        x /= self.nh();
+        let ha = x + self.hits_min;
+        Some((ha as i32, hb as i32, mv as i32, bk as i32, sh as i32, r as i32))
+    }
 }
 
 fn info_key_flat(s: &State) -> Vec<i32> {
@@ -336,6 +416,8 @@ struct MicroSolver {
     tm_of: Vec<u8>,
     keep: HashMap<(u8, Vec<i32>), Vec<bool>>,
     leaf_override: HashMap<Vec<i32>, f64>,
+    v1_flat: Option<Arc<Vec<f64>>>,
+    v1_layout: Option<V1Layout>,
     r_a: Vec<f64>,
     r_b: Vec<f64>,
     v: Vec<f64>,
@@ -364,6 +446,8 @@ impl MicroSolver {
             tm_of: Vec::new(),
             keep: HashMap::new(),
             leaf_override: HashMap::new(),
+            v1_flat: None,
+            v1_layout: None,
             r_a: Vec::new(),
             r_b: Vec::new(),
             v: Vec::new(),
@@ -485,33 +569,24 @@ impl MicroSolver {
         if s.order_b.is_empty() {
             return 1.0;
         }
+        // Exact 1v1 value: dense grid (table builder) or the loaded belief table.
+        if s.order_a.len() == 1 && s.order_b.len() == 1 {
+            if let Some(v) = self.v1_leaf_value(s) {
+                return v;
+            }
+            if let Some(key) = self.v1_belief_key(s) {
+                if let Ok(guard) = v1_table().lock() {
+                    if let Some(&v) = guard.get(&key) {
+                        return v;
+                    }
+                }
+            }
+        }
         // Learned (belief-conditioned) value injected from Python: exact-HP
         // 2v2/3v3 leaves are evaluated by the value network, keyed by the
         // flat state encoding.
         if let Some(&v) = self.leaf_override.get(&encode_state(s)) {
             return v;
-        }
-        // Exact 1v1 value when the game has reduced to a duel (one char each).
-        if s.order_a.len() == 1 && s.order_b.len() == 1 {
-            let da = self.trunk.dmg_units_between(0, s.order_a[0], 1, s.order_b[0]);
-            let db = self.trunk.dmg_units_between(1, s.order_b[0], 0, s.order_a[0]);
-            let hb = if da > 0 { (s.hp_b[0] + da - 1) / da } else { 1_000_000 };
-            let ha = if db > 0 { (s.hp_a[0] + db - 1) / db } else { 1_000_000 };
-            let key = (
-                ha.max(1),
-                hb.max(1),
-                s.bank_a,
-                s.bank_b,
-                s.sh_a,
-                s.sh_b,
-                s.turn,
-                s.to_move,
-            );
-            if let Ok(guard) = v1_table().lock() {
-                if let Some(&v) = guard.get(&key) {
-                    return v;
-                }
-            }
         }
         // Material fallback (2v2/3v3 leaves or a table miss). Bodies are the
         // decisive quantity in 3v3 (a one-body lead is nearly a win), so they
@@ -522,6 +597,49 @@ impl MicroSolver {
         let material = (ha - hb) as f64 / 6000.0;
         let bodies = (s.order_a.len() as f64 - s.order_b.len() as f64) * 0.35;
         (material + bodies).clamp(-1.0, 1.0)
+    }
+
+    /// Canonical-belief 1v1 key of a 1v1 state: (hA, hB, mover, own bank,
+    /// own sh, R, turn-clamped). None unless the game is a 1v1 duel.
+    fn v1_belief_key(&self, s: &State) -> Option<VKey> {
+        if s.order_a.len() != 1 || s.order_b.len() != 1 {
+            return None;
+        }
+        let da = self.trunk.dmg_units_between(0, s.order_a[0], 1, s.order_b[0]);
+        let db = self.trunk.dmg_units_between(1, s.order_b[0], 0, s.order_a[0]);
+        if da <= 0 || db <= 0 {
+            return None;
+        }
+        let hb = (s.hp_b[0] + da - 1) / da;
+        let ha = (s.hp_a[0] + db - 1) / db;
+        let mv = s.to_move;
+        let bank = if mv == 0 { s.bank_a } else { s.bank_b };
+        let sh = if mv == 0 { s.sh_a } else { s.sh_b };
+        let r = if mv == 0 { s.sh_b + s.bank_b } else { s.sh_a + s.bank_a };
+        let t = if s.turn >= 7 { 7 } else { s.turn };
+        Some((ha.max(1), hb.max(1), mv, bank, sh, r, t))
+    }
+
+    /// Dense-grid 1v1 value (table-builder leaf path), turn-invariant.
+    fn v1_leaf_value(&self, s: &State) -> Option<f64> {
+        let flat = self.v1_flat.as_ref()?;
+        let layout = self.v1_layout.as_ref()?;
+        if s.order_a.len() != 1 || s.order_b.len() != 1 {
+            return None;
+        }
+        let da = self.trunk.dmg_units_between(0, s.order_a[0], 1, s.order_b[0]);
+        let db = self.trunk.dmg_units_between(1, s.order_b[0], 0, s.order_a[0]);
+        if da <= 0 || db <= 0 {
+            return None;
+        }
+        let hb = (s.hp_b[0] + da - 1) / da;
+        let ha = (s.hp_a[0] + db - 1) / db;
+        let mv = s.to_move;
+        let bank = if mv == 0 { s.bank_a } else { s.bank_b };
+        let sh = if mv == 0 { s.sh_a } else { s.sh_b };
+        let r = if mv == 0 { s.sh_b + s.bank_b } else { s.sh_a + s.bank_a };
+        let idx = layout.index(ha.max(1), hb.max(1), mv, bank, sh, r)?;
+        flat.get(idx).copied()
     }
 
     fn sigs(&self) -> Vec<Vec<f64>> {
@@ -1008,7 +1126,7 @@ fn load_1v1_table(path: String) -> PyResult<usize> {
             continue;
         }
         let f: Vec<&str> = line.split(',').collect();
-        if f.len() < 9 {
+        if f.len() < 8 {
             continue;
         }
         let parse = |s: &str| -> i32 { s.trim().parse::<i32>().unwrap_or(0) };
@@ -1020,13 +1138,136 @@ fn load_1v1_table(path: String) -> PyResult<usize> {
             parse(f[4]),
             parse(f[5]),
             parse(f[6]),
-            parse(f[7]),
         );
-        let val = f[8].trim().parse::<f64>().unwrap_or(0.0);
+        let val = f[7].trim().parse::<f64>().unwrap_or(0.0);
         guard.insert(key, val);
         count += 1;
     }
     Ok(count)
+}
+
+/// One backward-induction step over a slice [start, end) of the dense
+/// belief-state grid: for every (hA, hB, mover, own_bank, own_sh, R), build a
+/// depth-2 belief-root micro-tree (roots = the opponent's (bank, sh) splits of
+/// R, uniform), solve it with CFR, and store the belief-root value. Leaves are
+/// evaluated from `leaf_flat` (same dense layout). Parallelism is provided by
+/// the caller (processes); this function is single-threaded. Returns
+/// (slice_values, max_abs_delta within the slice).
+#[pyfunction]
+#[pyo3(signature = (leaf_flat, start=0, end=0, root_turn=7, hits_min=1, hits_max=16,
+                    bank_max=4, sh_max=8, r_max=8, gamma=1.0, solve_iters=200))]
+fn solve_1v1_step(
+    py: Python<'_>,
+    leaf_flat: Vec<f64>,
+    start: usize,
+    end: usize,
+    root_turn: i32,
+    hits_min: usize,
+    hits_max: usize,
+    bank_max: usize,
+    sh_max: usize,
+    r_max: usize,
+    gamma: f64,
+    solve_iters: usize,
+) -> PyResult<(Vec<f64>, f64)> {
+    let layout = V1Layout { hits_min, hits_max, bank_max, sh_max, r_max };
+    if leaf_flat.len() != layout.size() {
+        return Err(PyValueError::new_err(format!(
+            "leaf table size {} != expected {}",
+            leaf_flat.len(),
+            layout.size()
+        )));
+    }
+    if !(1..=100).contains(&root_turn) {
+        return Err(PyValueError::new_err("root_turn out of range"));
+    }
+    let n = layout.size();
+    let end = if end == 0 { n } else { end.min(n) };
+    let start = start.min(end);
+    if start >= end {
+        return Ok((Vec::new(), 0.0));
+    }
+    let team_a = vec![(0u8, 2000i32, (hits_max as i32) * 200)];
+    let team_b = vec![(0u8, 2000i32, (hits_max as i32) * 200)];
+    let trunk = Trunk::new(team_a, team_b, 30, root_turn);
+    let leaf = Arc::new(leaf_flat);
+
+    let (out, max_delta) = py
+        .allow_threads(move || -> Result<(Vec<f64>, f64), String> {
+            let mut out = vec![0.0f64; end - start];
+            for (k, i) in (start..end).enumerate() {
+                let (hA, hB, mv, bk, sh, r) = layout.decode(i).expect("in-range index");
+                let roots = build_belief_roots(&layout, hA, hB, mv, bk, sh, r, root_turn);
+                let mut ms = MicroSolver::new(trunk.clone(), roots, 2u8, gamma);
+                ms.v1_flat = Some(Arc::clone(&leaf));
+                ms.v1_layout = Some(layout);
+                for _ in 0..solve_iters {
+                    ms.iterate();
+                }
+                let (_, v) = ms.root_strategy();
+                out[k] = v;
+            }
+            let max_delta = out
+                .iter()
+                .enumerate()
+                .map(|(k, a)| (a - leaf[start + k]).abs())
+                .fold(0.0f64, f64::max);
+            Ok((out, max_delta))
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok((out, max_delta))
+}
+
+/// Belief-root states for one belief-state: all (bank_opp, sh_opp) with
+/// bank_opp + sh_opp == r, uniform weights (sums to 1). mv selects whose own
+/// split is known: mv=0 (A acts) -> (bank_a, sh_a) = (bk, sh); mv=1 -> B's.
+fn build_belief_roots(
+    layout: &V1Layout,
+    hA: i32,
+    hB: i32,
+    mv: i32,
+    bk: i32,
+    sh: i32,
+    r: i32,
+    turn: i32,
+) -> Vec<(State, f64)> {
+    let bmin = (r - layout.sh_max as i32).max(0);
+    let bmax = r.min(layout.bank_max as i32);
+    let n = (bmax - bmin + 1) as f64;
+    let w = 1.0 / n;
+    let mut roots = Vec::with_capacity((bmax - bmin + 1) as usize);
+    for bank_opp in bmin..=bmax {
+        let sh_opp = r - bank_opp;
+        let state = if mv == 0 {
+            State {
+                order_a: vec![0],
+                hp_a: vec![hA * 200],
+                bank_a: bk,
+                sh_a: sh,
+                order_b: vec![0],
+                hp_b: vec![hB * 200],
+                bank_b: bank_opp,
+                sh_b: sh_opp,
+                turn,
+                to_move: 0,
+            }
+        } else {
+            State {
+                order_a: vec![0],
+                hp_a: vec![hA * 200],
+                bank_a: bank_opp,
+                sh_a: sh_opp,
+                order_b: vec![0],
+                hp_b: vec![hB * 200],
+                bank_b: bk,
+                sh_b: sh,
+                turn,
+                to_move: 1,
+            }
+        };
+        roots.push((state, w));
+    }
+    roots
 }
 
 #[pymodule]
@@ -1037,5 +1278,6 @@ fn _cote_cfr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_micro_belief, m)?)?;
     m.add_function(wrap_pyfunction!(micro_stats, m)?)?;
     m.add_function(wrap_pyfunction!(load_1v1_table, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_1v1_step, m)?)?;
     Ok(())
 }

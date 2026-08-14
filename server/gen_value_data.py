@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 
 import _cote_cfr  # noqa: E402
 
-_TABLE = os.path.join(REPO, "cote_cfr", "1v1_table_cap6.csv")
+_TABLE = os.path.join(REPO, "cote_cfr", "1v1_table.csv")
 _cote_cfr.load_1v1_table(_TABLE)
 
 _NET = None  # optional value network for leaves, set by the Pool initializer
