@@ -21,3 +21,7 @@ baseline_*.txt
 
 # Server test output (checkpoints, trajectories, pool)
 server_out/
+
+# Rust build artifacts
+cote_cfr/target/
+cote_cfr/Cargo.lock
