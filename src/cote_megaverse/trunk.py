@@ -4,16 +4,15 @@ The trunk is the upper level of the game: all characters, their stack order,
 voluntary switches, forced promotion on death, banks, shields and the turn
 schedule. It is solved by CFR; when the game reduces to a 1v1 (each side has
 one living character), the trunk hands off to a belief-conditioned 1v1 "leaf"
-(solver_tree_fh.py) whose value is used as the terminal value.
+(the 1v1 table) whose value is used as the terminal value.
 
 Abstraction
 -----------
-Real HP is tracked in units of 10: ``hp_units = hp // 10``. Damage per landed
-hit is ``atk * multiplier`` -- always a multiple of 10 -- so ``damage_units =
-atk * mult // 10`` is exact and decrements ``hp_units`` by an integer. Each
-character's HP is tracked individually (a character switched out keeps its
-damaged HP and returns damaged). The only abstraction error is the real game's
-exchange rounding (to 100 HP), the same error the 1v1 hits abstraction accepts.
+Real HP is tracked in units of 10: ``hp_units = hp // 10``. Damage matches
+rules.py exactly: each hit deals ``round(atk * mult / 100) * 100`` HP ==
+``round(atk * mult / 100) * 10`` units, total = per-hit times ``landed``.
+Each character's HP is tracked individually (a character switched out keeps its
+damaged HP and returns damaged).
 
 State
 -----
@@ -26,11 +25,9 @@ A tuple ``(orderA, hpA, bankA, shA, orderB, hpB, bankB, shB, turn, to_move)``:
 
 Character attributes (type, atk, hp) are fixed per game instance and stored on
 the Trunk, not in the state. Hits-to-kill against a given active opponent:
-``hits = ceil(hp_units / damage_units)``.
+``ceil(hp_units / per_hit_units)`` (exact, per-hit damage is linear).
 """
 from __future__ import annotations
-
-from math import ceil
 
 MAX_BANK = 4
 TURN_ACTIONS = {1: 1, 2: 2, 3: 2, 4: 2, 5: 3, 6: 3}
@@ -50,12 +47,6 @@ def multiplier(attacker: int, defender: int) -> float:
 
 def to_units(hp: int) -> int:
     return hp // 10
-
-
-def hits_to_kill(hp_units: int, damage_units: int) -> int:
-    if damage_units <= 0:
-        return 10 ** 6
-    return max(1, ceil(hp_units / damage_units))
 
 
 class Trunk:
@@ -96,17 +87,25 @@ class Trunk:
             ]
 
     # ------------------------------------------------------------ damage
-    def dmg_units_between(self, actor_side, actor_id, defender_side,
-                          defender_id):
+    def per_hit_units(self, actor_side, actor_id, defender_side, defender_id):
         a = self.teamA if actor_side == 0 else self.teamB
         d = self.teamB if actor_side == 0 else self.teamA
         atk = a[actor_id][1]
         m = multiplier(a[actor_id][0], d[defender_id][0])
-        return int(atk * m) // 10
+        return round(atk * m / 100) * 10
+
+    def dmg_total_units(self, actor_side, actor_id, defender_side,
+                        defender_id, landed):
+        if landed <= 0:
+            return 0
+        return self.per_hit_units(actor_side, actor_id, defender_side,
+                                  defender_id) * landed
 
     def hits(self, hp_units, actor_side, actor_id, defender_side, defender_id):
-        return hits_to_kill(hp_units, self.dmg_units_between(
-            actor_side, actor_id, defender_side, defender_id))
+        ph = self.per_hit_units(actor_side, actor_id, defender_side, defender_id)
+        if ph <= 0:
+            return 10 ** 6
+        return max(1, (hp_units + ph - 1) // ph)
 
     # ------------------------------------------------------------ budget
     def budget(self, st):
@@ -149,11 +148,11 @@ class Trunk:
                 i = order.index(sw)
                 order.insert(0, order.pop(i))
                 hp.insert(0, hp.pop(i))
-            dmg = self.dmg_units_between(0, order[0], 1, orderB[0])
+            dmg = self.dmg_total_units(0, order[0], 1, orderB[0], max(0, a - shB))
             landed = max(0, a - shB)
             if landed:
                 hpb = list(hpB)
-                hpb[0] = max(0, hpb[0] - landed * dmg)
+                hpb[0] = max(0, hpb[0] - dmg)
                 if hpb[0] <= 0:
                     orderB, hpB = self._promote(orderB, hpb, orderB[0])
                 else:
@@ -166,11 +165,11 @@ class Trunk:
             i = order.index(sw)
             order.insert(0, order.pop(i))
             hp.insert(0, hp.pop(i))
-        dmg = self.dmg_units_between(1, order[0], 0, orderA[0])
+        dmg = self.dmg_total_units(1, order[0], 0, orderA[0], max(0, a - shA))
         landed = max(0, a - shA)
         if landed:
             hpa = list(hpA)
-            hpa[0] = max(0, hpa[0] - landed * dmg)
+            hpa[0] = max(0, hpa[0] - dmg)
             if hpa[0] <= 0:
                 orderA, hpA = self._promote(orderA, hpa, orderA[0])
             else:

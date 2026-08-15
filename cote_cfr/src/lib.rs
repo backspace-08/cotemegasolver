@@ -140,12 +140,53 @@ impl Trunk {
         }
     }
 
-    fn dmg_units_between(&self, actor_side: u8, actor_id: u8, _defender_side: u8, defender_id: u8) -> i32 {
+    /// Python round() semantics: round half to even (rules.py rounded_damage).
+    fn py_round(x: f64) -> i64 {
+        let f = x.floor();
+        let diff = x - f;
+        if diff < 0.5 {
+            f as i64
+        } else if diff > 0.5 {
+            f as i64 + 1
+        } else {
+            let fi = f as i64;
+            if fi % 2 == 0 {
+                fi
+            } else {
+                fi + 1
+            }
+        }
+    }
+
+    /// Damage of one hit in units of 10 HP, matching rules.py per_hit_damage:
+    /// ``round(atk * mult / 100) * 100`` HP == *10 in units.
+    fn per_hit_units(&self, actor_side: u8, actor_id: u8, defender_side: u8, defender_id: u8) -> i32 {
         let a = if actor_side == 0 { &self.team_a } else { &self.team_b };
         let d = if actor_side == 0 { &self.team_b } else { &self.team_a };
         let atk = a[actor_id as usize].1;
         let m = multiplier(a[actor_id as usize].0, d[defender_id as usize].0);
-        (atk as f64 * m) as i32 / 10
+        (Self::py_round(atk as f64 * m / 100.0) * 10) as i32
+    }
+
+    /// Total damage in units of 10 HP for ``landed`` hits (per-hit rounding).
+    fn dmg_total_units(&self, actor_side: u8, actor_id: u8, defender_side: u8, defender_id: u8, landed: i32) -> i32 {
+        if landed <= 0 {
+            return 0;
+        }
+        self.per_hit_units(actor_side, actor_id, defender_side, defender_id) * landed
+    }
+
+    /// Hits-to-kill for a defender with ``hp_units`` (units of 10 HP): the
+    /// smallest h with per_hit_units * h >= hp_units (exact, per-hit linear).
+    fn hits_to_kill(&self, actor_side: u8, actor_id: u8, defender_side: u8, defender_id: u8, hp_units: i32) -> i32 {
+        if hp_units <= 0 {
+            return 1;
+        }
+        let ph = self.per_hit_units(actor_side, actor_id, defender_side, defender_id);
+        if ph <= 0 {
+            return i32::MAX;
+        }
+        (hp_units + ph - 1) / ph
     }
 
     fn budget(&self, s: &State) -> i32 {
@@ -198,12 +239,12 @@ impl Trunk {
                 let h = hp_a.remove(i);
                 hp_a.insert(0, h);
             }
-            let dmg = self.dmg_units_between(0, order_a[0], 1, s.order_b[0]);
             let landed = (a - s.sh_b).max(0);
+            let dmg = self.dmg_total_units(0, order_a[0], 1, s.order_b[0], landed);
             let mut order_b = s.order_b.clone();
             let mut hp_b = s.hp_b.clone();
             if landed > 0 {
-                hp_b[0] = (hp_b[0] - landed * dmg).max(0);
+                hp_b[0] = (hp_b[0] - dmg).max(0);
                 if hp_b[0] <= 0 {
                     let dead = order_b[0];
                     let (no, nh) = Self::promote(&order_b, &hp_b, dead);
@@ -233,12 +274,12 @@ impl Trunk {
                 let h = hp_b.remove(i);
                 hp_b.insert(0, h);
             }
-            let dmg = self.dmg_units_between(1, order_b[0], 0, s.order_a[0]);
             let landed = (a - s.sh_a).max(0);
+            let dmg = self.dmg_total_units(1, order_b[0], 0, s.order_a[0], landed);
             let mut order_a = s.order_a.clone();
             let mut hp_a = s.hp_a.clone();
             if landed > 0 {
-                hp_a[0] = (hp_a[0] - landed * dmg).max(0);
+                hp_a[0] = (hp_a[0] - dmg).max(0);
                 if hp_a[0] <= 0 {
                     let dead = order_a[0];
                     let (no, nh) = Self::promote(&order_a, &hp_a, dead);
@@ -605,13 +646,13 @@ impl MicroSolver {
         if s.order_a.len() != 1 || s.order_b.len() != 1 {
             return None;
         }
-        let da = self.trunk.dmg_units_between(0, s.order_a[0], 1, s.order_b[0]);
-        let db = self.trunk.dmg_units_between(1, s.order_b[0], 0, s.order_a[0]);
+        let da = self.trunk.dmg_total_units(0, s.order_a[0], 1, s.order_b[0], 1);
+        let db = self.trunk.dmg_total_units(1, s.order_b[0], 0, s.order_a[0], 1);
         if da <= 0 || db <= 0 {
             return None;
         }
-        let hb = (s.hp_b[0] + da - 1) / da;
-        let ha = (s.hp_a[0] + db - 1) / db;
+        let hb = self.trunk.hits_to_kill(0, s.order_a[0], 1, s.order_b[0], s.hp_b[0]);
+        let ha = self.trunk.hits_to_kill(1, s.order_b[0], 0, s.order_a[0], s.hp_a[0]);
         let mv = s.to_move;
         let bank = if mv == 0 { s.bank_a } else { s.bank_b };
         let sh = if mv == 0 { s.sh_a } else { s.sh_b };
@@ -627,13 +668,13 @@ impl MicroSolver {
         if s.order_a.len() != 1 || s.order_b.len() != 1 {
             return None;
         }
-        let da = self.trunk.dmg_units_between(0, s.order_a[0], 1, s.order_b[0]);
-        let db = self.trunk.dmg_units_between(1, s.order_b[0], 0, s.order_a[0]);
+        let da = self.trunk.dmg_total_units(0, s.order_a[0], 1, s.order_b[0], 1);
+        let db = self.trunk.dmg_total_units(1, s.order_b[0], 0, s.order_a[0], 1);
         if da <= 0 || db <= 0 {
             return None;
         }
-        let hb = (s.hp_b[0] + da - 1) / da;
-        let ha = (s.hp_a[0] + db - 1) / db;
+        let hb = self.trunk.hits_to_kill(0, s.order_a[0], 1, s.order_b[0], s.hp_b[0]);
+        let ha = self.trunk.hits_to_kill(1, s.order_b[0], 0, s.order_a[0], s.hp_a[0]);
         let mv = s.to_move;
         let bank = if mv == 0 { s.bank_a } else { s.bank_b };
         let sh = if mv == 0 { s.sh_a } else { s.sh_b };
@@ -755,6 +796,45 @@ impl MicroSolver {
         self.tm_of[iid] == 0
     }
 
+    /// Average-profile value of the tree: the expected payoff when both
+    /// players follow their AVERAGE strategy (``avg``), not the current
+    /// regret-matching strategy. CFR's current strategy oscillates while the
+    /// average converges, so using ``self.v`` (computed from the current
+    /// strategy) makes the reported value unstable.
+    fn avg_profile_value(&self) -> f64 {
+        let n = self.states.len();
+        let mut sigs: Vec<Vec<f64>> = Vec::with_capacity(self.infos.len());
+        for info in &self.infos {
+            let na = info.n_acts;
+            let total: f64 = info.avg.iter().sum();
+            if total > 0.0 {
+                sigs.push(info.avg.iter().map(|x| x / total).collect());
+            } else {
+                sigs.push(vec![1.0 / na as f64; na]);
+            }
+        }
+        let mut val = vec![0.0f64; n];
+        for i in (0..n).rev() {
+            if let Some(t) = self.terminals[i] {
+                val[i] = t;
+            } else if self.depths[i] >= self.depth {
+                val[i] = self.leaf_value(i);
+            } else {
+                let sig = &sigs[self.info_id[i]];
+                let mut acc = 0.0;
+                for (a, &ci) in self.children[i].iter().enumerate() {
+                    acc += sig[a] * val[ci];
+                }
+                val[i] = self.gamma * acc;
+            }
+        }
+        let mut value = 0.0;
+        for &(ri, w) in &self.roots {
+            value += w * val[ri];
+        }
+        value
+    }
+
     fn root_strategy(&self) -> (Vec<f64>, f64) {
         let iid = self.info_id[self.roots[0].0];
         let na = self.infos[iid].n_acts;
@@ -765,11 +845,7 @@ impl MicroSolver {
         } else {
             vec![1.0 / na as f64; na]
         };
-        let mut value = 0.0;
-        for &(ri, w) in &self.roots {
-            value += w * self.v[ri];
-        }
-        (probs, value)
+        (probs, self.avg_profile_value())
     }
 
     fn rebuild(&mut self) {
@@ -918,10 +994,8 @@ impl PyTrunk {
     /// Active matchup hits-to-kill: (hits A needs to kill B's active, hits B needs to kill A's active).
     fn hits(&self, state: Vec<i32>) -> PyResult<(i32, i32)> {
         let st = decode_state(&state)?;
-        let db = self.inner.dmg_units_between(0, st.order_a[0], 1, st.order_b[0]);
-        let da = self.inner.dmg_units_between(1, st.order_b[0], 0, st.order_a[0]);
-        let hb = if db > 0 { (st.hp_b[0] + db - 1) / db } else { 1_000_000 };
-        let ha = if da > 0 { (st.hp_a[0] + da - 1) / da } else { 1_000_000 };
+        let hb = self.inner.hits_to_kill(0, st.order_a[0], 1, st.order_b[0], st.hp_b[0]);
+        let ha = self.inner.hits_to_kill(1, st.order_b[0], 0, st.order_a[0], st.hp_a[0]);
         Ok((ha.max(1), hb.max(1)))
     }
 }

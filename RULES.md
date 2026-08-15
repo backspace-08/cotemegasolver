@@ -42,14 +42,16 @@ Every distinct pair of types falls into exactly one of these three cases.
 
 ### Damage
 
-Damage dealt per turn:
+Each hit deals damage rounded to the nearest 100; the turn's total is the sum
+over hits:
 
 ```
-damage = round(ATK × multiplier × hits / 100) × 100
+per_hit = round(ATK × multiplier / 100) × 100
+damage  = per_hit × hits
 ```
 
-The total is rounded to the nearest 100 (Python `round()` behavior). Damage is
-always a multiple of 100. 0 hits → 0 damage.
+`round()` is Python's: round half to even (`round(2.5) = 2`, `round(3.5) = 4`).
+Per-hit damage is always a multiple of 100. 0 hits → 0 damage.
 
 ## 3. Action budget
 
@@ -132,7 +134,7 @@ When a player attacks:
 1. Shields block: `blocked = min(attacks, shields)`.
 2. `hits = attacks − blocked`.
 3. Damage to the opponent's active character:
-   `round(ATK × multiplier × hits / 100) × 100`.
+   `round(ATK × multiplier / 100) × 100` per hit, `hits` times.
 4. HP drops; if HP ≤ 0 the character dies.
 5. If the active character died, the next living one is promoted for free.
 

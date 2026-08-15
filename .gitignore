@@ -30,6 +30,7 @@ cote_cfr/Cargo.lock
 cote_cfr/1v1_table.csv
 server/ckpt_1v1/
 server/ckpt_calib/
+server/ckpt_test/
 
 table_out/*.log
 table_out/*.err

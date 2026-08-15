@@ -21,14 +21,14 @@ class NewEngineTests(unittest.TestCase):
             self.assertIn(character.atk, ATK_POOL)
             self.assertEqual(character.max_hp, character.hp)
 
-    def test_exchange_rounds_once_after_aggregate_damage(self):
+    def test_exchange_rounds_per_hit(self):
         state = initial((Type.D, Type.A, Type.C), (Type.C, Type.A, Type.D))
         attacker = replace(state.player.characters[0], atk=2100)
         defender = replace(state.opponent.characters[0], hp=6000, max_hp=6000)
         self.assertEqual(exchange_damage(attacker, defender, 1), 1500)
-        self.assertEqual(exchange_damage(attacker, defender, 4), 5900)
-        self.assertEqual(attacks_to_kill(attacker, defender, shields=0), 5)
-        self.assertEqual(attacks_to_kill(attacker, defender, shields=2), 7)
+        self.assertEqual(exchange_damage(attacker, defender, 4), 6000)
+        self.assertEqual(attacks_to_kill(attacker, defender, shields=0), 4)
+        self.assertEqual(attacks_to_kill(attacker, defender, shields=2), 6)
 
     def test_seed_reproduces_team_stats(self):
         first = initial((Type.A, Type.B, Type.C), (Type.B, Type.C, Type.D), rng=Random(17))

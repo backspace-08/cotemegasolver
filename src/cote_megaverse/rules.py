@@ -35,11 +35,16 @@ def rounded_damage(value: float) -> int:
     return round(value / 100) * 100
 
 
+def per_hit_damage(attacker: Character, defender: Character) -> int:
+    """Python-rounded damage of a single hit (round half to even)."""
+    return rounded_damage(attacker.atk * multiplier(attacker.type, defender.type))
+
+
 def exchange_damage(attacker: Character, defender: Character, attacks: int) -> int:
-    """Round one aggregate exchange once, after multiplying all hits."""
+    """Total damage of ``attacks`` hits, each rounded to the nearest 100."""
     if attacks <= 0:
         return 0
-    return rounded_damage(attacker.atk * multiplier(attacker.type, defender.type) * attacks)
+    return per_hit_damage(attacker, defender) * attacks
 
 
 def attacks_to_kill(attacker: Character, defender: Character, shields: int = 0,
