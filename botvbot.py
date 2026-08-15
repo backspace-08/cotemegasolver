@@ -50,17 +50,21 @@ def run_match(seed, new_first, left="v3", right="v2", bodies=3, depth=2,
             planning = GameState(state.player, state.opponent, state.turn, True)
             move = left_pl.choose(planning)
             state = apply(state, move)
+            if move.attacks:
+                left_pl.observe_attack(move.attacks,
+                                       min(move.attacks, before.opponent.shields))
             right_pl.observe(move.attacks, move.bonuses, move.switch,
                              budget=before.player.actions)
-            right_pl.observe_shields(before.player.shields)
         else:
             before = state
             planning = GameState(state.opponent, state.player, state.turn, True)
             move = right_pl.choose(planning)
             state = apply(state, move)
+            if move.attacks:
+                right_pl.observe_attack(move.attacks,
+                                        min(move.attacks, before.player.shields))
             left_pl.observe(move.attacks, move.bonuses, move.switch,
                             budget=before.opponent.actions)
-            left_pl.observe_shields(before.opponent.shields)
     if state.opponent.lost:
         return {"seed": seed, "new_first": new_first, "winner": "LEFT"}
     if state.player.lost:

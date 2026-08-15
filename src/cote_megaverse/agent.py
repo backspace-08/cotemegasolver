@@ -215,6 +215,19 @@ class Planner:
         self.model.observe_our_attack(shields + 1, shields)
         self.history.reveal_latest_defends(shields)
 
+    def observe_attack(self, attacks: int, blocked: int):
+        """Report an attack we made with its exact blocked count.
+
+        ``blocked < attacks`` pins the defender's shields exactly; ``blocked ==
+        attacks`` (attack fully absorbed) only proves ``shields >= attacks``.
+        This is the honest form of ``observe_shields``: passing the defender's
+        full shields when only a lower bound was revealed would leak hidden info.
+        """
+        if attacks <= 0:
+            return
+        self.model.observe_our_attack(attacks, blocked)
+        self.history.reveal_latest_defends(blocked)
+
     def belief(self, opponent: GameState | object) -> ShieldBelief:
         """Distribution over the opponent's currently held shields.
 

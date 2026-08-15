@@ -24,7 +24,7 @@ def play(args):
         move = p.choose(planning)
         if move.attacks:
             target = state.opponent if state.player_to_move else state.player
-            p.observe_shields(target.shields)
+            p.observe_attack(move.attacks, min(move.attacks, target.shields))
         pl[not state.player_to_move].observe(
             move.attacks, move.bonuses, move.switch,
             budget=(state.player if state.player_to_move

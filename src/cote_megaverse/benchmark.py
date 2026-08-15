@@ -280,7 +280,9 @@ def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
             # The human's shields are revealed every resolution, attack or not
             # (before.player is the human). The planner models the human, so it
             # observes their shields symmetrically with the human's UI.
-            planner.observe_shields(before.player.shields)
+            if move.attacks:
+                planner.observe_attack(move.attacks,
+                                       min(move.attacks, before.player.shields))
         replay.append({"turn": state.turn, "player_to_move": state.player_to_move,
                        "move": move.label})
         state = apply(state, move)
@@ -393,7 +395,8 @@ def run_self_play(seed=0, max_half_turns=40, depth=2):
         })
         if move.attacks:
             target = state.opponent if state.player_to_move else state.player
-            planner.observe_shields(target.shields)
+            planner.observe_attack(move.attacks,
+                                   min(move.attacks, target.shields))
         planners[not state.player_to_move].observe(
             move.attacks, move.bonuses, move.switch,
             budget=(state.player if state.player_to_move

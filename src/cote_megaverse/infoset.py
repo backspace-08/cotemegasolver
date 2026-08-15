@@ -114,6 +114,12 @@ class OpponentModel:
         ``blocked < attacks`` pins the shield count exactly. ``blocked ==
         attacks`` only proves a lower bound. Either way the surviving worlds
         also fix the bank, because the split must sum to the remainder.
+
+        Callers must invoke this while the candidates still describe the
+        opponent's LAST remainder (i.e. before observing the opponent's next
+        turn): the shields our attack met were placed on that last turn, so they
+        pin its split. Driving harnesses pass the defender's current shields
+        (``before.<defender>.shields``) right after the attacker's move.
         """
         if attacks <= 0:
             return

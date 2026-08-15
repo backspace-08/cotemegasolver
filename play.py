@@ -374,7 +374,8 @@ def _play_one_game(game):
                 move = planner.choose(planning)
                 before = state
                 if move.attacks:
-                    planner.observe_shields(before.player.shields)
+                    planner.observe_attack(move.attacks,
+                                           min(move.attacks, before.player.shields))
                 state = apply(state, move)
                 show_resolution(before, move, state, "AI")
             game["state"] = state

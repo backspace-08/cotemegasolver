@@ -83,6 +83,13 @@ class CFRBot:
         """Our attack met this many shields (mirrors Planner.observe_shields)."""
         self.model.observe_our_attack(shields + 1, shields)
 
+    def observe_attack(self, attacks, blocked):
+        """Report an attack we made with its exact blocked count (honest form
+        of ``observe_shields``: a fully-absorbed attack is only a lower bound)."""
+        if attacks <= 0:
+            return
+        self.model.observe_our_attack(attacks, blocked)
+
     # ----------------------------------------------------------------- choice
     def choose(self, state) -> Allocation:
         state = _masked(state)
