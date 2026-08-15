@@ -211,7 +211,8 @@ def load(p):
     with open(p) as f:
         for row in csv.DictReader(f):
             k = (int(row["hA"]), int(row["hB"]), int(row["to_move"]),
-                 int(row["own_bank"]), int(row["own_sh"]), int(row["R"]), int(row["turn"])
+                 int(row["own_bank"]), int(row["own_sh"]), int(row["R"]),
+                 int(row["turn"]))
             d[k] = float(row["value"])
     return d
 old, new = load(old_p), load(new_p)
