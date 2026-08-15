@@ -25,12 +25,21 @@ class PublicHistory:
 
     def observe(self, attacks: int, bonuses: int, switched: bool,
                 budget: int | None = None):
-        shields = None if budget is None else max(
-            0, budget - attacks - bonuses - int(switched))
-        self.actions.append((attacks, shields or 0, bonuses, int(switched)))
-        self.held_shields = shields
-        self.events.append(PublicEvent(attacks, bonuses, int(switched), shields))
-        self._update_policy(attacks, shields or 0, bonuses)
+        """Record one opponent allocation from PUBLIC facts only.
+
+        ``bonuses`` is the opponent's hidden split and is deliberately never
+        used: deriving a shield count from it (budget - attacks - bonuses)
+        would leak the exact hidden shields. What is public is the budget, the
+        attack count and a visible switch; the remainder (defends + bank) is
+        ambiguous until the resolution reveals the defender's shields.
+        """
+        if budget is None:
+            budget = attacks + int(switched)
+        remainder = max(0, budget - attacks - int(switched))
+        self.actions.append((attacks, remainder, 0, int(switched)))
+        self.held_shields = None
+        self.events.append(PublicEvent(attacks, 0, int(switched), None))
+        self._update_policy(attacks, remainder, 0)
 
     def observe_resolved(self, attacks, defends, bonuses, switched=False):
         self.actions.append((attacks, defends, bonuses, int(switched)))
@@ -221,6 +230,11 @@ class Planner:
 
         ``blocked < attacks`` pins the defender's shields exactly; ``blocked ==
         attacks`` (fully absorbed) only proves ``shields >= attacks``.
+
+        Per RULES.md §8 the defender's shields are revealed in FULL on every
+        resolution, so driving harnesses should call ``observe_shields`` (which
+        pins the exact value). This method only records the lower-bound case and
+        exists for legacy callers.
         """
         if attacks <= 0:
             return

@@ -220,8 +220,11 @@ class Planner:
 
         ``blocked < attacks`` pins the defender's shields exactly; ``blocked ==
         attacks`` (attack fully absorbed) only proves ``shields >= attacks``.
-        This is the honest form of ``observe_shields``: passing the defender's
-        full shields when only a lower bound was revealed would leak hidden info.
+
+        Per RULES.md §8 the defender's shields are revealed in FULL on every
+        resolution, so driving harnesses should call ``observe_shields`` (which
+        pins the exact value). This method only records the lower-bound case and
+        exists for legacy callers.
         """
         if attacks <= 0:
             return

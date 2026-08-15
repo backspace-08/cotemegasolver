@@ -207,6 +207,9 @@ def compact_render(game):
     your, bot = st.player, st.opponent
     ya = your.characters[your.active]
     ba = bot.characters[bot.active]
+    # sbot = the bot's shields revealed on the LAST resolution (historical,
+    # public info). It is NOT the bot's current hidden shields, so it must not
+    # be treated as a live "shields to kill through" threshold.
     sbot = game.get("sBot", 0)
     mult = multiplier(ya.type, ba.type)
     nxt = min(MAX_ACTIONS, base_budget(st.turn + 1) + MAX_BONUS)
@@ -222,8 +225,7 @@ def compact_render(game):
                if i != your.active and c.alive]
     hint = {"mult": mult,
             "kill0": attacks_to_kill(ya, ba, 0),
-            "killS": attacks_to_kill(ya, ba, sbot),
-            "sBot": sbot,
+            "lastShields": sbot,
             "worst": worst,
             "shld": shld,
             "sw": sw_opts,
@@ -373,9 +375,10 @@ def _play_one_game(game):
                                      state.turn, True)
                 move = planner.choose(planning)
                 before = state
-                if move.attacks:
-                    planner.observe_attack(move.attacks,
-                                           min(move.attacks, before.player.shields))
+                # The human's shields are revealed on EVERY resolution, attack
+                # or not, in full (RULES.md §8) — so observe them exactly, the
+                # same as run_bot does.
+                planner.observe_shields(before.player.shields)
                 state = apply(state, move)
                 show_resolution(before, move, state, "AI")
             game["state"] = state

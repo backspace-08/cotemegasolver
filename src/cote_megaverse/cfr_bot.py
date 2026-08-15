@@ -84,8 +84,12 @@ class CFRBot:
         self.model.observe_our_attack(shields + 1, shields)
 
     def observe_attack(self, attacks, blocked):
-        """Report an attack we made with its exact blocked count (honest form
-        of ``observe_shields``: a fully-absorbed attack is only a lower bound)."""
+        """Report an attack we made with its exact blocked count.
+
+        Per RULES.md §8 the defender's shields are revealed in FULL on every
+        resolution, so driving harnesses should call ``observe_shields`` (which
+        pins the exact value). This lower-bound form exists for legacy callers.
+        """
         if attacks <= 0:
             return
         self.model.observe_our_attack(attacks, blocked)
