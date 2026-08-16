@@ -125,10 +125,10 @@ step_smoke() {
     --workers "$SMOKE_WORKERS" \
     --hits-min 1 --hits-max "$SMOKE_HITS_MAX" \
     --bank-max 4 --sh-max 8 --r-max 8 \
-    --gamma 1.0 --solve-iters "$SOLVE_ITERS" \
+    --gamma 0.995 --solve-iters "$SOLVE_ITERS" \
     --max-iters "$SMOKE_ITERS" --tol 0.05 --force
 
-  log "smoke: consistency check (turn1 <- turn3 must converge)"
+  log "smoke: consistency check (phase-4 value must be a fixed point of T_2)"
   python - "$TABLE_TEST" "$SMOKE_HITS_MAX" <<'EOF'
 import csv, sys
 sys.path.insert(0, "."); sys.path.insert(0, "src")
@@ -139,26 +139,24 @@ nh = hits_max - 1 + 1
 def gidx(hA, hB, mv, bank, sh, r):
     return (((((hA-1)*nh + (hB-1))*2 + mv) * 5 + bank) * 9 + sh) * 9 + r
 
-leaf3 = [0.0] * (nh*nh*2*5*9*9)
+leaf7 = [0.0] * (nh*nh*2*5*9*9)
 with open(table) as f:
     for row in csv.DictReader(f):
-        if int(row["turn"]) == 3:
-            leaf3[gidx(int(row["hA"]), int(row["hB"]), int(row["to_move"]),
+        if int(row["turn"]) == 7:
+            leaf7[gidx(int(row["hA"]), int(row["hB"]), int(row["to_move"]),
                       int(row["own_bank"]), int(row["own_sh"]), int(row["R"]))] = float(row["value"])
 
-key = gidx(2, 2, 0, 0, 0, 0)
-vals = []
-for it in (100, 1600):
-    out, _ = _cote_cfr.solve_1v1_step(leaf3, start=key, end=key+1, root_turn=1,
-                                      hits_min=1, hits_max=hits_max, bank_max=4,
-                                      sh_max=8, r_max=8, gamma=1.0, solve_iters=it)
-    vals.append(out[0])
-spread = abs(vals[0] - vals[1])
-print("turn1<-(turn3) iters=100/1600: %s spread=%.4f" % (vals, spread))
-if spread > 0.01:
-    print("FAIL: value is not converging; do NOT run the full build")
+key = gidx(3, 3, 0, 0, 0, 0)
+out, _ = _cote_cfr.solve_1v1_step(leaf7, start=key, end=key+1, root_turn=7,
+                                  hits_min=1, hits_max=hits_max, bank_max=4,
+                                  sh_max=8, r_max=8, gamma=0.995, solve_iters=200)
+spread = abs(out[0] - leaf7[key])
+print("phase4 fixed point fresh(3,3): table=%.4f T_2(table)=%.4f spread=%.4f"
+      % (leaf7[key], out[0], spread))
+if spread > 0.02:
+    print("FAIL: phase-4 is not a fixed point; do NOT run the full build")
     sys.exit(1)
-print("OK: converged")
+print("OK: phase-4 self-consistent")
 EOF
 }
 
@@ -172,7 +170,7 @@ step_full() {
     --workers "$WORKERS" \
     --hits-min 1 --hits-max 16 \
     --bank-max 4 --sh-max 8 --r-max 8 \
-    --gamma 1.0 --solve-iters "$SOLVE_ITERS" \
+    --gamma 0.995 --solve-iters "$SOLVE_ITERS" \
     --max-iters "$FULL_ITERS" --tol "$FULL_TOL"
   # no --force: re-running resumes from $CKPT
   echo "done -> $TABLE"

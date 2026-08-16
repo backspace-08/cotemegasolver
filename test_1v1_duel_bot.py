@@ -84,8 +84,8 @@ def main():
     ap.add_argument("--games", type=int, default=12)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--cfr-depth", type=int, default=3)
-    ap.add_argument("--cfr-iters", type=int, default=100,
-                    help="CFR iters per re-solve (100 == 200 results, ~2x faster)")
+    ap.add_argument("--cfr-iters", type=int, default=400,
+                    help="CFR iters per re-solve (400 == converged strategy)")
     ap.add_argument("--cfr-cap", type=int, default=6)
     ap.add_argument("--pl-depth", type=int, default=2)
     ap.add_argument("--pl-max-nodes", type=int, default=2000)

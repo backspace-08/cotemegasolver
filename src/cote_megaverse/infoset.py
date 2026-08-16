@@ -83,6 +83,13 @@ class OpponentModel:
     _bank_count: float = 1.0
     _attack_actions: float = 0.0
     _total_actions: float = 0.0
+    # Type hypothesis: the opponent is either a "full shielder", a "no
+    # shielder" or "random split". Each fully-observed shield count (R, s) is
+    # exact evidence (RULES.md §8); the posterior concentrates on the type that
+    # explains the observed counts. This makes a persistent full-shielder reach
+    # P(sh=R) ~0.96/0.99 after 2/3 fully-blocked rounds, where a plain
+    # Beta-Binomial prior over per-action defend rate stays diffuse.
+    _shield_samples: list[tuple[int, int]] = field(default_factory=list)
 
     # ---------------------------------------------------------------- observe
 
@@ -106,7 +113,8 @@ class OpponentModel:
         self._total_actions += max(1, budget)
         # A fresh remainder replaces the previous hidden state entirely: old
         # shields have expired and the old bank was just spent.
-        self._candidates = self._prior(remainder)
+        first_round = len(self.records) == 1
+        self._candidates = self._prior(remainder, first_round)
 
     def observe_our_attack(self, attacks: int, blocked: int):
         """Record what our own attack learned about their shields.
@@ -127,6 +135,13 @@ class OpponentModel:
             self._restrict(lambda shields, bank: shields == blocked)
         else:
             self._restrict(lambda shields, bank: shields >= attacks)
+        # Record the fully-revealed (remainder, shields) observation for the
+        # type hypothesis. RULES.md §8: shields always fire/burn and are shown
+        # exactly, so ``blocked < attacks`` pins the shield count precisely.
+        if blocked < attacks and self.records:
+            rem = self.records[-1].remainder
+            if rem >= 0:
+                self._shield_samples.append((rem, blocked))
         # The revealed split also feeds the behavioural prior (``defend_share``):
         # an opponent repeatedly observed holding no shields is a banker, so the
         # next remainder must lean toward bank rather than stay near-uniform.
@@ -199,31 +214,63 @@ class OpponentModel:
 
     # ---------------------------------------------------------------- helpers
 
-    def _prior(self, remainder: int) -> dict[tuple[int, int], float]:
-        """Weight each legal split by observed splitting behaviour.
+    def _prior(self, remainder: int, first_round: bool = False) -> dict[tuple[int, int], float]:
+        """Belief over the splits of ``remainder`` under the type hypothesis.
 
-        Model each action in the remainder as independently going to a defend
-        with probability ``defend_share``, giving a binomial weight over the
-        legal splits. The previous linear blend was far too flat: an opponent
-        who had demonstrably never shielded still got ~0.09 weight on "holding
-        four shields" and only ~0.31 on "holding none", so evidence barely
-        moved the belief and the planner could neither punish a banking
-        opponent nor trust its own damage estimate.
+        Three opponent types compete: "full shield" (H1, every action goes to
+        shields -> split (R, 0)), "no shield" (H0s, shields never used ->
+        split (0, R)) and "random" (Hr, uniform over the R+1 splits). Each
+        fully-revealed shield count (R, s) from RULES.md §8 is exact evidence;
+        the posterior concentrates on the type that explains the observed
+        counts. A persistent full-shielder pushes P(sh=R) to ~0.96/0.99 after
+        2/3 rounds; a persistent banker concentrates on sh=0 the same way. A
+        small uniform floor keeps every legal split live (AGENT.md §9: splits
+        are pruned by public facts, never by assumption).
 
-        ``EPSILON`` keeps every legal split alive. AGENT.md §9 requires that
-        splits be pruned by public facts, never by assumption, so no world may
-        ever reach exactly zero here; only ``_restrict`` (hard evidence) removes
-        worlds.
+        ``first_round`` disables the full-shielder type: on the very first
+        observed turn the opponent has not yet been attacked, so placing
+        shields is strictly dominated (the equilibrium never plays d4 from a
+        fresh board). The whole remainder must then be bank.
         """
-        EPSILON = 0.02
-        share = min(0.98, max(0.02, self.defend_share))
+        if remainder <= 0:
+            return {(0, 0): 1.0}
+        n_splits = remainder + 1
+        p_full, p_none = self._type_posterior(remainder, first_round)
+        p_rand = 1.0 - p_full - p_none
+        EPSILON = 0.005
         weights: dict[tuple[int, int], float] = {}
         for shields, bank in legal_splits(remainder):
-            weight = (_binomial(shields + bank, shields)
-                      * share ** shields
-                      * (1.0 - share) ** bank)
+            if shields == remainder:
+                weight = p_full + p_rand / n_splits
+            elif shields == 0:
+                weight = p_none + p_rand / n_splits
+            else:
+                weight = p_rand / n_splits
             weights[(shields, bank)] = weight + EPSILON
         return weights
+
+    def _type_posterior(self, remainder: int, first_round: bool = False) -> tuple[float, float]:
+        """(P(full-shielder), P(no-shielder)) from observed shield counts."""
+        prior_full = 0.0 if first_round else 0.4
+        prior_none = 1.0 if first_round else 0.4
+        if not self._shield_samples:
+            return prior_full, prior_none
+        like_full = 1.0
+        like_none = 1.0
+        like_rand = 1.0
+        for r, s in self._shield_samples:
+            # Full-shielder produces s == r always; no-shielder s == 0 always;
+            # random produces s uniform over 0..r.
+            like_full *= 1.0 if s == r else 0.0
+            like_none *= 1.0 if s == 0 else 0.0
+            like_rand *= 1.0 / (r + 1)
+        if like_full == 0.0 and like_none == 0.0:
+            return 0.0, 0.0
+        pf = prior_full * like_full
+        pn = prior_none * like_none
+        pr = (1.0 - prior_full - prior_none) * like_rand
+        total = pf + pn + pr
+        return pf / total, pn / total
 
     def _restrict(self, predicate):
         """Keep only worlds consistent with new evidence."""

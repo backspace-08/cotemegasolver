@@ -103,21 +103,21 @@ def read_meta(d):
 
 def _solve_slice(args):
     """Worker: solve one contiguous slice [start, end) of the grid."""
-    leaf, start, end, root_turn, L, gamma, solve_iters = args
+    leaf, start, end, root_turn, L, gamma, solve_iters, solve_depth = args
     out, delta = c.solve_1v1_step(
         leaf, start=start, end=end, root_turn=root_turn,
         hits_min=L["hits_min"], hits_max=L["hits_max"],
         bank_max=L["bank_max"], sh_max=L["sh_max"], r_max=L["r_max"],
-        gamma=gamma, solve_iters=solve_iters)
+        gamma=gamma, solve_iters=solve_iters, solve_depth=solve_depth)
     return start, out, delta
 
 
-def solve_full(pool, nworkers, leaf, root_turn, L, gamma, solve_iters):
+def solve_full(pool, nworkers, leaf, root_turn, L, gamma, solve_iters, solve_depth=2):
     """One backward-induction step over the whole grid via the worker pool."""
     n = grid_size(L)
     nworkers = min(nworkers, n)
     edges = [i * n // nworkers for i in range(nworkers + 1)]
-    tasks = [(leaf, edges[i], edges[i + 1], root_turn, L, gamma, solve_iters)
+    tasks = [(leaf, edges[i], edges[i + 1], root_turn, L, gamma, solve_iters, solve_depth)
              for i in range(nworkers)]
     out = [0.0] * n
     max_delta = 0.0
@@ -184,14 +184,22 @@ def run_ramp(pool, L, args, phase4):
             ramp[k] = load_ckpt(args.ckpt_dir, "ramp%d" % k)
             print("[resume] ramp turn %d loaded" % k, flush=True)
             continue
-        leaf = ramp.get(k + 2, phase4)
+        leaf = ramp.get(k + 2, phase4)  # noqa: F841 - kept for resume compatibility
         t0 = time.time()
-        V, _ = solve_full(pool, args.workers, leaf, root_turn=k, L=L,
-                          gamma=args.gamma, solve_iters=args.solve_iters)
+        # FIXED (was: one pass, depth=2, leaf=turn+2 cascade). The cascade is
+        # wrong: solve_1v1_step depth=2 with a turn+2 leaf gives values far from
+        # the deep resolve for turns 1..6 (verified: turn1/2/4 were 0.40/0.33/
+        # 0.18 vs gold 0.23/0.09/-0.12). Correct: each ramp turn k is solved to
+        # depth (7 - k) so its leaves land in the converged phase-4 table, i.e.
+        # it IS the deep resolve the bot would do at runtime.
+        depth = max(1, 7 - k)
+        V, _ = solve_full(pool, args.workers, phase4, root_turn=k, L=L,
+                          gamma=args.gamma, solve_iters=args.solve_iters,
+                          solve_depth=depth)
         ramp[k] = V
         save_ckpt(args.ckpt_dir, "ramp%d" % k, V)
         write_meta(args.ckpt_dir, {"phase": "ramp", "turn": k, "layout": L})
-        print("[ramp turn %d] done in %.1fs" % (k, time.time() - t0), flush=True)
+        print("[ramp turn %d] depth=%d done in %.1fs" % (k, depth, time.time() - t0), flush=True)
     return ramp
 
 
@@ -230,7 +238,7 @@ def main():
     ap.add_argument("--bank-max", type=int, default=4)
     ap.add_argument("--sh-max", type=int, default=8)
     ap.add_argument("--r-max", type=int, default=8)
-    ap.add_argument("--gamma", type=float, default=1.0)
+    ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--solve-iters", type=int, default=150)
     ap.add_argument("--max-iters", type=int, default=35)
     ap.add_argument("--tol", type=float, default=0.02)

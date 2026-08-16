@@ -1229,7 +1229,8 @@ fn load_1v1_table(path: String) -> PyResult<usize> {
 /// (slice_values, max_abs_delta within the slice).
 #[pyfunction]
 #[pyo3(signature = (leaf_flat, start=0, end=0, root_turn=7, hits_min=1, hits_max=16,
-                    bank_max=4, sh_max=8, r_max=8, gamma=1.0, solve_iters=200))]
+                    bank_max=4, sh_max=8, r_max=8, gamma=1.0, solve_iters=200,
+                    solve_depth=2))]
 fn solve_1v1_step(
     py: Python<'_>,
     leaf_flat: Vec<f64>,
@@ -1243,6 +1244,7 @@ fn solve_1v1_step(
     r_max: usize,
     gamma: f64,
     solve_iters: usize,
+    solve_depth: u8,
 ) -> PyResult<(Vec<f64>, f64)> {
     let layout = V1Layout { hits_min, hits_max, bank_max, sh_max, r_max };
     if leaf_flat.len() != layout.size() {
@@ -1254,6 +1256,9 @@ fn solve_1v1_step(
     }
     if !(1..=100).contains(&root_turn) {
         return Err(PyValueError::new_err("root_turn out of range"));
+    }
+    if !(1..=16).contains(&solve_depth) {
+        return Err(PyValueError::new_err("solve_depth out of range (1..=16)"));
     }
     let n = layout.size();
     let end = if end == 0 { n } else { end.min(n) };
@@ -1271,8 +1276,9 @@ fn solve_1v1_step(
             let mut out = vec![0.0f64; end - start];
             for (k, i) in (start..end).enumerate() {
                 let (hA, hB, mv, bk, sh, r) = layout.decode(i).expect("in-range index");
-                let roots = build_belief_roots(&layout, hA, hB, mv, bk, sh, r, root_turn);
-                let mut ms = MicroSolver::new(trunk.clone(), roots, 2u8, gamma);
+                let roots = build_belief_roots(&layout, &trunk, &leaf, hA, hB, mv, bk, sh, r,
+                                               root_turn, gamma, solve_iters);
+                let mut ms = MicroSolver::new(trunk.clone(), roots, solve_depth, gamma);
                 ms.v1_flat = Some(Arc::clone(&leaf));
                 ms.v1_layout = Some(layout);
                 for _ in 0..solve_iters {
@@ -1293,10 +1299,23 @@ fn solve_1v1_step(
 }
 
 /// Belief-root states for one belief-state: all (bank_opp, sh_opp) with
-/// bank_opp + sh_opp == r, uniform weights (sums to 1). mv selects whose own
+/// bank_opp + sh_opp == r, weighted by a TYPE-MIXTURE prior over the
+/// defender's behaviour, not by a flat uniform prior. mv selects whose own
 /// split is known: mv=0 (A acts) -> (bank_a, sh_a) = (bk, sh); mv=1 -> B's.
+///
+/// The prior is the same three-type mixture used at runtime in
+/// ``infoset.OpponentModel``: "full shielder" (H1, every action goes to
+/// shields -> split (R, 0)), "no shielder" (H0s, never shields -> (0, R))
+/// and "random" (Hr, uniform over the legal splits). The weight of the full
+/// shielder grows with the defender's desperation (low remaining HP): a
+/// 1-HP defender must play maximal shields, so P(sh = R) concentrates toward
+/// ~0.7 instead of the flat 1/(R+1) that the uniform prior assigned. This is
+/// O(1) per cell, has no recursive dependency on the defender's past bank,
+/// and keeps every legal split alive via a small uniform floor (AGENT.md §9).
 fn build_belief_roots(
     layout: &V1Layout,
+    _trunk: &Trunk,
+    _leaf: &Arc<Vec<f64>>,
     hA: i32,
     hB: i32,
     mv: i32,
@@ -1304,14 +1323,36 @@ fn build_belief_roots(
     sh: i32,
     r: i32,
     turn: i32,
+    _gamma: f64,
+    _solve_iters: usize,
 ) -> Vec<(State, f64)> {
     let bmin = (r - layout.sh_max as i32).max(0);
     let bmax = r.min(layout.bank_max as i32);
     let n = (bmax - bmin + 1) as f64;
-    let w = 1.0 / n;
     let mut roots = Vec::with_capacity((bmax - bmin + 1) as usize);
+
+    // Defender's remaining HP decides how much it must shield.
+    let hp_def = if mv == 0 { hB } else { hA };
+    // Full-shielder weight: maximal when the defender is at 1 HP, decays
+    // linearly as its HP grows (a healthy defender is not forced to turtle).
+    let hits_span = (layout.hits_max as i32 - layout.hits_min as i32 + 1).max(1) as f64;
+    let desperation = ((layout.hits_max as i32 - hp_def).max(0) as f64) / hits_span;
+    let p_full = 0.70 * desperation + 0.05;
+    let p_none = 0.08 * (1.0 - desperation) + 0.02;
+    let p_rand = (1.0 - p_full - p_none).max(0.02);
+
     for bank_opp in bmin..=bmax {
         let sh_opp = r - bank_opp;
+        let w_rand = p_rand / n;
+        let w = if r == 0 {
+            1.0 // only (0,0) is legal; nothing is hidden
+        } else if sh_opp == r {
+            p_full + w_rand
+        } else if sh_opp == 0 {
+            p_none + w_rand
+        } else {
+            w_rand
+        };
         let state = if mv == 0 {
             State {
                 order_a: vec![0],

@@ -54,7 +54,7 @@ def _encode_state(state, opp_bank, opp_sh):
 
 
 class CFRBot:
-    def __init__(self, depth=3, iters=200, cap=6, gamma=0.995,
+    def __init__(self, depth=3, iters=400, cap=6, gamma=0.995,
                  temperature=0.0, rng=None, value_leaf=None):
         self.depth = depth
         self.iters = iters
