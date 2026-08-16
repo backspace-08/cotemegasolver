@@ -1,8 +1,21 @@
-"""Direct test of the new 1v1 table: CFRBot vs Planner in PURE 1v1 duels.
+"""CFRBot vs Planner in PURE 1v1 duels - stat-profile benchmark.
 
-Adapts run_match to a 1v1 initial state (1 char per side) so the new table is
-exercised every move. Seats alternate. Win rate should be high if the table
-gives the bot decisive duel play.
+Design (3 requirements):
+1. Stat profiles sized for the 1..16 hits grid so both sides get 2-3 full
+   burst cycles. hits = ceil(HP / per_hit), per_hit = round(ATK*mult/100)*100.
+     A. deep-midgame (main): HP=24000 ATK=1500, 1.0x vs 1.0x -> 16 vs 16 hits
+     B. cfr-defense  (stress): HP=22000 ATK=2000, CFR 0.7x vs PL 1.3x
+        -> Planner kills CFR in 9 hits, CFR needs 16 -> physical handicap
+     C. cfr-attack   (exploit): HP=22000 ATK=2000, CFR 1.3x vs PL 0.7x
+        -> CFR kills Planner in 9 hits, survives 16 -> forced-lethal speed
+2. Spam/draw isolation: a4-shield spam ends in a draw at the turn cap (0.0),
+   never a win; scoring is Win=+1.0, Draw=0.0, Loss=-1.0. Turn cap 40
+   half-turns covers 3 burst exchanges of 16 hits.
+3. Duplicate Matching: each seed runs twice (CFR as P1 and as P2); per-seed
+   delta = score(P1) + score(P2) cancels the first-move advantage.
+   delta=0 -> equal, >0 -> CFR stronger, +2 -> sweep.
+
+Default: 50 duplicate pairs (100 matches) on Profile A.
 """
 import argparse
 import json
@@ -17,32 +30,56 @@ sys.path.insert(0, BASE)
 sys.path.insert(0, os.path.join(BASE, "src"))
 
 from cote_megaverse.rules import (  # noqa: E402
-    GameState, Side, Character, Type, apply)
+    GameState, Side, Character, Type, apply, per_hit_damage, multiplier)
 from cote_megaverse.agent import Planner  # noqa: E402
 from cote_megaverse.cfr_bot import CFRBot  # noqa: E402
 
-HP_POOL = (5700, 5800, 5900, 6000, 6100, 6200, 6300)
-ATK_POOL = (1900, 2000, 2100)
+WIN, DRAW, LOSS = 1.0, 0.0, -1.0
+
+# type value layout: A=0 B=1 C=2 D=3; (attacker+1)%4==defender -> 1.3
+BEATS = {Type.A: Type.B, Type.B: Type.C, Type.C: Type.D, Type.D: Type.A}
+
+PROFILES = {
+    "A": {"hp": 24000, "atk": 1500,
+          "pl_type": Type.A, "cfr_type": Type.A},          # 1.0 vs 1.0 -> 16v16
+    "B": {"hp": 22000, "atk": 2000,
+          "pl_type": Type.D, "cfr_type": Type.A},          # D beats A: PL 1.3
+    "C": {"hp": 22000, "atk": 2000,
+          "pl_type": Type.B, "cfr_type": Type.A},          # A beats B: CFR 1.3
+}
 
 
-def make_side(t, rng):
-    hp = rng.choice(HP_POOL)
-    atk = rng.choice(ATK_POOL)
+def profile_hits(prof):
+    """(hits CFR needs to kill PL, hits PL needs to kill CFR) from the formula."""
+    def per_hit(atk, mult):
+        return per_hit_damage(
+            Character(type=Type.A, hp=1, atk=atk, max_hp=1),
+            Character(type=Type.A, hp=1, atk=1, max_hp=1)) if mult == 1.0 else \
+            round(atk * mult / 100) * 100
+    cfr_m = multiplier(prof["cfr_type"], prof["pl_type"])
+    pl_m = multiplier(prof["pl_type"], prof["cfr_type"])
+    h = prof["hp"]
+    return (max(1, -(-h // per_hit(prof["atk"], cfr_m))),
+            max(1, -(-h // per_hit(prof["atk"], pl_m))))
+
+
+def make_side(t, hp, atk):
     return Side(characters=(Character(type=t, hp=hp, atk=atk, max_hp=hp),),
                 active=0, stack_order=(0,), bonus=0, shields=0, actions=0)
 
 
-def run_duel(seed, cfr_first, cfr_depth, cfr_iters, cfr_cap,
-             pl_depth, pl_max_nodes, cfr_gamma,
-             max_half_turns=60):
-    rng = random.Random(seed)
-    types = list(Type)
-    state = GameState(player=make_side(rng.choice(types), rng),
-                      opponent=make_side(rng.choice(types), rng),
-                      turn=1, player_to_move=True).prepare()
+def run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
+             pl_depth, pl_max_nodes, cfr_gamma, cfr_prune_after,
+             cfr_temperature, start_turn, max_half_turns=40):
+    prof = PROFILES[profile]
+    state = GameState(player=make_side(prof["cfr_type"], prof["hp"], prof["atk"]),
+                      opponent=make_side(prof["pl_type"], prof["hp"], prof["atk"]),
+                      turn=start_turn, player_to_move=True).prepare()
     if not cfr_first:
         state = replace(state, player_to_move=False).prepare()
-    cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap, gamma=cfr_gamma)
+    cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap, gamma=cfr_gamma,
+                 prune_after=cfr_prune_after, temperature=cfr_temperature,
+                 rng=random.Random(seed))
     pl = Planner(depth=pl_depth, max_nodes=pl_max_nodes)
     for _ in range(max_half_turns):
         if state.player.lost or state.opponent.lost:
@@ -65,58 +102,102 @@ def run_duel(seed, cfr_first, cfr_depth, cfr_iters, cfr_cap,
                         budget=before.opponent.actions)
     if state.opponent.lost:
         return {"seed": seed, "cfr_first": cfr_first, "winner": "CFR",
-                "half_turns": state.turn}
+                "score": WIN, "half_turns": state.turn}
     if state.player.lost:
         return {"seed": seed, "cfr_first": cfr_first, "winner": "PL",
-                "half_turns": state.turn}
+                "score": LOSS, "half_turns": state.turn}
     return {"seed": seed, "cfr_first": cfr_first, "winner": "DRAW",
-            "half_turns": state.turn}
+            "score": DRAW, "half_turns": state.turn}
 
 
 def _worker(task):
-    seed, cfr_first, cfr_depth, cfr_iters, cfr_cap, pl_depth, pl_max_nodes, cfr_gamma = task
-    return run_duel(seed, cfr_first, cfr_depth, cfr_iters, cfr_cap,
-                    pl_depth, pl_max_nodes, cfr_gamma)
+    (seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap, pl_depth,
+     pl_max_nodes, cfr_gamma, cfr_prune_after, cfr_temperature,
+     start_turn) = task
+    return run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
+                    pl_depth, pl_max_nodes, cfr_gamma, cfr_prune_after,
+                    cfr_temperature, start_turn)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--games", type=int, default=12)
-    ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--cfr-depth", type=int, default=3)
-    ap.add_argument("--cfr-iters", type=int, default=400,
-                    help="CFR iters per re-solve (400 == converged strategy)")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="A")
+    ap.add_argument("--pairs", type=int, default=50,
+                    help="duplicate seed pairs; 2 matches per pair (P1+P2) = 100")
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--max-half-turns", type=int, default=40,
+                    help="turn cap; reaching it is a draw (0.0)")
+    ap.add_argument("--cfr-depth", type=int, default=4,
+                    help="phase-4 (turn>=7) resolve depth; even depth = whole rounds")
+    ap.add_argument("--cfr-iters", type=int, default=100)
+    ap.add_argument("--cfr-prune-after", type=int, default=20)
+    ap.add_argument("--cfr-temperature", type=float, default=1.0,
+                    help="sample actions from the CFR strategy (1.0); 0 = argmax")
     ap.add_argument("--cfr-cap", type=int, default=6)
     ap.add_argument("--pl-depth", type=int, default=2)
     ap.add_argument("--pl-max-nodes", type=int, default=2000)
     ap.add_argument("--cfr-gamma", type=float, default=0.995)
     ap.add_argument("--seed-start", type=int, default=7000)
+    ap.add_argument("--start-turn", type=int, default=7,
+                    help="duel starts at this turn (7 = phase-4, table is authoritative)")
     ap.add_argument("--tag", default="duel")
     a = ap.parse_args()
-    tasks = [(a.seed_start + i, (i % 2 == 0), a.cfr_depth, a.cfr_iters,
-              a.cfr_cap, a.pl_depth, a.pl_max_nodes, a.cfr_gamma)
-             for i in range(a.games)]
+
+    prof = PROFILES[a.profile]
+    hits = profile_hits(prof)
+    print("[profile %s] HP=%d ATK=%d  hits: CFR->PL %d, PL->CFR %d"
+          % (a.profile, prof["hp"], prof["atk"], hits[0], hits[1]), flush=True)
+
+    tasks = []
+    for i in range(a.pairs):
+        seed = a.seed_start + i
+        for cfr_first in (True, False):
+            tasks.append((seed, cfr_first, a.profile, a.cfr_depth, a.cfr_iters,
+                          a.cfr_cap, a.pl_depth, a.pl_max_nodes, a.cfr_gamma,
+                          a.cfr_prune_after, a.cfr_temperature, a.start_turn))
+
     with Pool(a.workers) as pool:
         results = list(pool.imap_unordered(_worker, tasks))
+
     out = os.path.join(BASE, "runs", "botvbot", "%s.json" % a.tag)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:
         json.dump(results, fh, ensure_ascii=False, indent=1)
+
     n = len(results)
-    cw = sum(1 for r in results if r["winner"] == "CFR")
-    pw = sum(1 for r in results if r["winner"] == "PL")
-    dr = sum(1 for r in results if r["winner"] == "DRAW")
+    by_seat = {True: [], False: []}
+    delta_by_seed = {}
+    for r in results:
+        by_seat[r["cfr_first"]].append(r["score"])
+        delta_by_seed[r["seed"]] = delta_by_seed.get(r["seed"], 0.0) + r["score"]
+    deltas = list(delta_by_seed.values())
+    mean_delta = sum(deltas) / len(deltas)
+
+    def agg(scores):
+        w = sum(1 for s in scores if s > 0)
+        d = sum(1 for s in scores if s == 0)
+        l = sum(1 for s in scores if s < 0)
+        return w, d, l
+
+    cw, cd, cl = agg([r["score"] for r in results])
+    fw, fd, fl = agg(by_seat[True])
+    sw, sd, sl = agg(by_seat[False])
     lens = [r["half_turns"] for r in results]
-    print("tag=%s 1v1 duels=%d  CFR=%d Planner=%d DRAW=%d  CFR-winrate=%.1f%%"
-          % (a.tag, n, cw, pw, dr, 100.0 * cw / n))
-    print("  avg half_turns=%.1f  min=%d max=%d  draws=%.1f%%"
-          % (sum(lens) / n, min(lens), max(lens), 100.0 * dr / n))
-    for seat in (True, False):
-        rs = [r for r in results if r["cfr_first"] == seat]
-        wn = sum(1 for r in rs if r["winner"] == "CFR")
-        print("  CFR-first=%s: CFR-wins %d/%d = %.1f%%"
-              % (seat, wn, len(rs), 100.0 * wn / len(rs)))
-    print("results -> %s" % out)
+
+    print("[profile %s] duels=%d (%d pairs x 2 seats)  "
+          "CFR=%d Planner=%d DRAW=%d  CFR-winrate=%.1f%%" % (
+              a.profile, n, a.pairs, cw, cl, cd, 100.0 * cw / n))
+    print("  mean delta per seed = %+.3f  (0=equal, +2=sweep)"
+          % mean_delta, flush=True)
+    print("  seeds: sweep +2=%d, +1=%d, 0=%d, -1=%d, -2=%d"
+          % tuple(sum(1 for d in deltas if d == x) for x in (2, 1, 0, -1, -2)),
+          flush=True)
+    print("  CFR-first (P1): W%d/D%d/L%d = %.1f%%   CFR-second (P2): W%d/D%d/L%d = %.1f%%"
+          % (fw, fd, fl, 100.0 * fw / len(by_seat[True]),
+             sw, sd, sl, 100.0 * sw / len(by_seat[False])), flush=True)
+    print("  avg half_turns=%.1f  min=%d max=%d  draws=%.1f%%" % (
+        sum(lens) / n, min(lens), max(lens), 100.0 * cd / n), flush=True)
+    print("results -> %s" % out, flush=True)
 
 
 if __name__ == "__main__":

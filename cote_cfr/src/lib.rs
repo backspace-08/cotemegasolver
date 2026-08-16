@@ -465,6 +465,13 @@ struct MicroSolver {
     reach_opp_sum: Vec<f64>,
     reach_self_sum: Vec<f64>,
     cfv_contrib: Vec<Vec<f64>>,
+    // Regret pruning: after `prune_after` iterations, skip traversing actions
+    // with non-positive regret (their regret-matching weight is 0 anyway, so
+    // values are unchanged; this only skips the tree walk). Recomputed each
+    // iteration so positive-regret actions always stay in.
+    mask: Vec<Vec<bool>>,
+    prune_after: usize,
+    iter_count: usize,
 }
 
 impl MicroSolver {
@@ -495,6 +502,9 @@ impl MicroSolver {
             reach_opp_sum: Vec::new(),
             reach_self_sum: Vec::new(),
             cfv_contrib: Vec::new(),
+            mask: Vec::new(),
+            prune_after: 0,
+            iter_count: 0,
         };
         s.build();
         s
@@ -600,6 +610,7 @@ impl MicroSolver {
         self.reach_opp_sum = vec![0.0; n_infos];
         self.reach_self_sum = vec![0.0; n_infos];
         self.cfv_contrib = vec![vec![0.0; max_acts]; n_infos];
+        self.mask = vec![vec![true; max_acts]; n_infos];
     }
 
     fn leaf_value(&self, i: usize) -> f64 {
@@ -707,6 +718,24 @@ impl MicroSolver {
     fn iterate(&mut self) {
         let n = self.states.len();
         let sigs = self.sigs();
+        self.iter_count += 1;
+        let do_prune = self.prune_after > 0 && self.iter_count > self.prune_after;
+        if do_prune {
+            for iid in 0..self.infos.len() {
+                let na = self.infos[iid].n_acts;
+                let mut any = false;
+                for a in 0..na {
+                    let keep = self.infos[iid].regret[a] > 0.0;
+                    self.mask[iid][a] = keep;
+                    any |= keep;
+                }
+                if !any {
+                    for a in 0..na {
+                        self.mask[iid][a] = true;
+                    }
+                }
+            }
+        }
         // reach
         self.r_a.fill(0.0);
         self.r_b.fill(0.0);
@@ -723,8 +752,15 @@ impl MicroSolver {
             if self.terminals[i].is_some() || self.depths[i] >= self.depth {
                 continue;
             }
-            let sig = &sigs[self.info_id[i]];
+            let iid = self.info_id[i];
+            let sig = &sigs[iid];
+            let m = if do_prune { Some(&self.mask[iid]) } else { None };
             for (a, &ci) in self.children[i].iter().enumerate() {
+                if let Some(mm) = m {
+                    if !mm[a] {
+                        continue;
+                    }
+                }
                 let p = sig[a];
                 if self.states[i].to_move == 0 {
                     self.r_a[ci] += self.r_a[i] * p;
@@ -742,9 +778,16 @@ impl MicroSolver {
             } else if self.depths[i] >= self.depth {
                 self.v[i] = self.leaf_value(i);
             } else {
-                let sig = &sigs[self.info_id[i]];
+                let iid = self.info_id[i];
+                let sig = &sigs[iid];
+                let m = if do_prune { Some(&self.mask[iid]) } else { None };
                 let mut acc = 0.0;
                 for (a, &ci) in self.children[i].iter().enumerate() {
+                    if let Some(mm) = m {
+                        if !mm[a] {
+                            continue;
+                        }
+                    }
                     acc += sig[a] * self.v[ci];
                 }
                 self.v[i] = self.gamma * acc;
@@ -766,7 +809,13 @@ impl MicroSolver {
             let slf = if tm == 0 { self.r_a[i] } else { self.r_b[i] };
             self.reach_opp_sum[iid] += opp;
             self.reach_self_sum[iid] += slf;
+            let m = if do_prune { Some(&self.mask[iid]) } else { None };
             for (a, &ci) in self.children[i].iter().enumerate() {
+                if let Some(mm) = m {
+                    if !mm[a] {
+                        continue;
+                    }
+                }
                 self.cfv_contrib[iid][a] += opp * self.v[ci];
             }
         }
@@ -866,6 +915,8 @@ impl MicroSolver {
         self.reach_opp_sum.clear();
         self.reach_self_sum.clear();
         self.cfv_contrib.clear();
+        self.mask.clear();
+        self.iter_count = 0;
         self.build();
     }
 
@@ -1010,6 +1061,7 @@ fn solve_micro_impl(
     cap: i32,
     start_turn: i32,
     prune: bool,
+    prune_after: usize,
 ) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
     let mut roots = Vec::with_capacity(root_states.len());
     let mut wsum = 0.0;
@@ -1028,6 +1080,7 @@ fn solve_micro_impl(
     }
     let trunk = Trunk::new(team_a, team_b, cap, start_turn);
     let mut solver = MicroSolver::new(trunk, roots, depth, gamma);
+    solver.prune_after = prune_after;
     if prune {
         // Burn-in on the full tree long enough for the strategy support to
         // mature before pruning. NOTE: on depth-3+ trees this needs thousands
@@ -1048,7 +1101,7 @@ fn solve_micro_impl(
 }
 
 #[pyfunction]
-#[pyo3(signature = (team_a, team_b, state, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1, prune=false))]
+#[pyo3(signature = (team_a, team_b, state, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1, prune=false, prune_after=0))]
 #[allow(clippy::too_many_arguments)]
 fn solve_micro(
     team_a: Vec<(u8, i32, i32)>,
@@ -1060,15 +1113,16 @@ fn solve_micro(
     cap: i32,
     start_turn: i32,
     prune: bool,
+    prune_after: usize,
 ) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
-    solve_micro_impl(team_a, team_b, vec![(state, 1.0)], depth, iters, gamma, cap, start_turn, prune)
+    solve_micro_impl(team_a, team_b, vec![(state, 1.0)], depth, iters, gamma, cap, start_turn, prune, prune_after)
 }
 
 /// Belief-weighted root: the acting player's info set is shared across all root
 /// states (same public observation), the opponent's "reach" into each is the
 /// belief weight. The returned value is the belief-weighted average.
 #[pyfunction]
-#[pyo3(signature = (team_a, team_b, states, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1, prune=false))]
+#[pyo3(signature = (team_a, team_b, states, depth=4, iters=500, gamma=0.995, cap=20, start_turn=1, prune=false, prune_after=0))]
 #[allow(clippy::too_many_arguments)]
 fn solve_micro_belief(
     team_a: Vec<(u8, i32, i32)>,
@@ -1080,8 +1134,9 @@ fn solve_micro_belief(
     cap: i32,
     start_turn: i32,
     prune: bool,
+    prune_after: usize,
 ) -> PyResult<(Vec<Vec<i32>>, Vec<f64>, f64)> {
-    solve_micro_impl(team_a, team_b, states, depth, iters, gamma, cap, start_turn, prune)
+    solve_micro_impl(team_a, team_b, states, depth, iters, gamma, cap, start_turn, prune, prune_after)
 }
 
 /// Depth-limited subgame solver with pluggable leaf values: the leaves are
@@ -1146,9 +1201,10 @@ impl MicroTree {
     }
 
     /// Run CFR with the given leaf values (flat state -> value).
-    #[pyo3(signature = (iters, gamma=0.995, override_=vec![]))]
-    fn solve(&mut self, iters: usize, gamma: f64, override_: Vec<(Vec<i32>, f64)>) {
+    #[pyo3(signature = (iters, gamma=0.995, override_=vec![], prune_after=0))]
+    fn solve(&mut self, iters: usize, gamma: f64, override_: Vec<(Vec<i32>, f64)>, prune_after: usize) {
         self.inner.gamma = gamma;
+        self.inner.prune_after = prune_after;
         self.inner.leaf_override.clear();
         for (k, v) in override_ {
             self.inner.leaf_override.insert(k, v);
@@ -1299,19 +1355,10 @@ fn solve_1v1_step(
 }
 
 /// Belief-root states for one belief-state: all (bank_opp, sh_opp) with
-/// bank_opp + sh_opp == r, weighted by a TYPE-MIXTURE prior over the
-/// defender's behaviour, not by a flat uniform prior. mv selects whose own
-/// split is known: mv=0 (A acts) -> (bank_a, sh_a) = (bk, sh); mv=1 -> B's.
-///
-/// The prior is the same three-type mixture used at runtime in
-/// ``infoset.OpponentModel``: "full shielder" (H1, every action goes to
-/// shields -> split (R, 0)), "no shielder" (H0s, never shields -> (0, R))
-/// and "random" (Hr, uniform over the legal splits). The weight of the full
-/// shielder grows with the defender's desperation (low remaining HP): a
-/// 1-HP defender must play maximal shields, so P(sh = R) concentrates toward
-/// ~0.7 instead of the flat 1/(R+1) that the uniform prior assigned. This is
-/// O(1) per cell, has no recursive dependency on the defender's past bank,
-/// and keeps every legal split alive via a small uniform floor (AGENT.md §9).
+/// bank_opp + sh_opp == r, weighted by a MAX-ENTROPY UNIFORM prior: every
+/// legal split gets exactly 1/(R+1). No type hypotheses, no desperation, no
+/// magic weights - identical to the runtime prior in ``infoset.OpponentModel``
+/// so table builder and resolver believe the same thing.
 fn build_belief_roots(
     layout: &V1Layout,
     _trunk: &Trunk,
@@ -1330,29 +1377,10 @@ fn build_belief_roots(
     let bmax = r.min(layout.bank_max as i32);
     let n = (bmax - bmin + 1) as f64;
     let mut roots = Vec::with_capacity((bmax - bmin + 1) as usize);
-
-    // Defender's remaining HP decides how much it must shield.
-    let hp_def = if mv == 0 { hB } else { hA };
-    // Full-shielder weight: maximal when the defender is at 1 HP, decays
-    // linearly as its HP grows (a healthy defender is not forced to turtle).
-    let hits_span = (layout.hits_max as i32 - layout.hits_min as i32 + 1).max(1) as f64;
-    let desperation = ((layout.hits_max as i32 - hp_def).max(0) as f64) / hits_span;
-    let p_full = 0.70 * desperation + 0.05;
-    let p_none = 0.08 * (1.0 - desperation) + 0.02;
-    let p_rand = (1.0 - p_full - p_none).max(0.02);
+    let w = if r == 0 { 1.0 } else { 1.0 / n };
 
     for bank_opp in bmin..=bmax {
         let sh_opp = r - bank_opp;
-        let w_rand = p_rand / n;
-        let w = if r == 0 {
-            1.0 // only (0,0) is legal; nothing is hidden
-        } else if sh_opp == r {
-            p_full + w_rand
-        } else if sh_opp == 0 {
-            p_none + w_rand
-        } else {
-            w_rand
-        };
         let state = if mv == 0 {
             State {
                 order_a: vec![0],

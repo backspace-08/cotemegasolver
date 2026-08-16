@@ -1,27 +1,28 @@
-"""Build the monolithic 1v1 table (Option A, gamma=1.0 truncated horizon).
+"""Build the phase-4 (stationary endgame) 1v1 table (gamma=0.995 truncated).
 
 Model
 -----
 No match cap in the real game -> infinite game, but we solve it as a
-TRUNCATED horizon with gamma=1.0: iterating the depth-2 operator T_2 gives the
-exact values of the (2k)-ply game; as k grows the values converge to the
-infinite-game value (games resolve: bank-burst beats the turtle). Wins are
-worth exactly +1 (maximally fight-promoting), no gamma tuning needed.
+TRUNCATED horizon with gamma=0.995: iterating the depth-2 operator T_2 gives
+the exact values of the (2k)-ply game; as k grows the values converge to the
+infinite-game value (games resolve: bank-burst beats the turtle).
 
 Phase 4 (turns >= 7, stationary budget): backward induction over the
 belief-state grid (hits, mover, own_bank, own_sh, R) until max-abs-delta < tol
-or max-iters. Ramp turns 1..6: one exact backward-induction pass per turn
-(leaves = the already-computed turn+2 table, or the phase-4 table for turns 6,5).
+or max-iters. This is the ONLY precomputed table: the bot resolves turns 1..6
+at runtime (Continual Subgame Resolving, depth = 7 - turn, leaves = this
+table), so no intermediate turn grids are built. ``--ramp`` optionally builds
+the old ramp turns 1..6 (deep resolve, slow, kept for reference only).
 
-Parallelism: multiprocessing (NOT threads — shared-heap allocator contention
+Parallelism: multiprocessing (NOT threads -- shared-heap allocator contention
 kills thread scaling). Each worker solves a contiguous slice of the grid via
 the single-threaded Rust call `solve_1v1_step`.
 
 Checkpoints: binary grids + meta.json in --ckpt-dir, saved after every phase-4
-iteration and every ramp turn. Resuming continues from the last checkpoint.
+iteration. Resuming continues from the last checkpoint.
 
-Output: belief-key CSV (hA,hB,to_move,own_bank,own_sh,R,turn,value); turn>=7 is
-clamped to 7 by the engine (phase-4 values are turn-invariant).
+Output: belief-key CSV (hA,hB,to_move,own_bank,own_sh,R,turn,value) with only
+the turn-7 (phase-4) slice unless --ramp.
 
 Usage (server, inside tmux):
   python server/build_1v1_table.py --workers 56 --out cote_cfr/1v1_table.csv
@@ -208,6 +209,8 @@ def dump_csv(args, L, phase4, ramp):
     with open(args.out, "w") as fh:
         fh.write("hA,hB,to_move,own_bank,own_sh,R,turn,value\n")
         for turn in (7, 6, 5, 4, 3, 2, 1):
+            if turn != 7 and turn not in ramp:
+                continue
             grid = phase4 if turn == 7 else ramp[turn]
             buf = []
             for hA in range(L["hits_min"], L["hits_max"] + 1):
@@ -242,7 +245,10 @@ def main():
     ap.add_argument("--solve-iters", type=int, default=150)
     ap.add_argument("--max-iters", type=int, default=35)
     ap.add_argument("--tol", type=float, default=0.02)
-    ap.add_argument("--no-ramp", action="store_true")
+    ap.add_argument("--ramp", action="store_true",
+                    help="also build ramp turns 1..6 (deep resolve, slow). "
+                         "Default: phase-4 only - the bot resolves turns 1..6 "
+                         "at runtime (Continual Subgame Resolving)")
     ap.add_argument("--no-dump", action="store_true")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
@@ -263,7 +269,7 @@ def main():
     pool = Pool(args.workers)
     try:
         phase4 = run_phase4(pool, L, args, meta)
-        if not args.no_ramp:
+        if args.ramp:
             ramp = run_ramp(pool, L, args, phase4)
         else:
             ramp = {}

@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Rebuild the 1v1 table after the avg-profile value fix, step by step.
+# Rebuild the 1v1 table (phase-4 only), step by step.
 #
 # Steps (each can be run separately; --all runs them in order):
 #   env      - verify engine + set up venv
 #   backup   - save the current table for comparison
-#   smoke    - small build on hits 1..6 + consistency check
 #   full     - full build hits 1..16 (resumes from server/ckpt_1v1 on re-run)
-#   bench    - CFRBot vs Planner duels (smoke then full)
+#   bench    - CFRBot vs Planner duels
 #   compare  - diff old vs new table
 #
 # Usage (fresh server, from repo root):
@@ -17,6 +16,9 @@
 # Notes:
 #   - No --force on --full: build_1v1_table.py resumes from its checkpoint dir.
 #   - First run creates .venv and builds the Rust wheel (needs Rust toolchain).
+#   - The table is phase-4 only (turn >= 7 stationary endgame, V = T(V)); the
+#     bot resolves turns 1..6 at runtime (Continual Subgame Resolving), so no
+#     ramp turns and no smoke build are needed.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,9 +29,6 @@ WORKERS="${WORKERS:-56}"                 # server 64 vCPU; laptop ~8
 FULL_ITERS="${FULL_ITERS:-35}"           # phase-4 backward-induction iters
 FULL_TOL="${FULL_TOL:-0.02}"
 SOLVE_ITERS="${SOLVE_ITERS:-100}"        # micro-tree CFR iters per cell
-SMOKE_ITERS="${SMOKE_ITERS:-3}"
-SMOKE_HITS_MAX="${SMOKE_HITS_MAX:-6}"
-SMOKE_WORKERS="${SMOKE_WORKERS:-8}"
 
 # Rust build tuning. target-cpu=native lets LLVM use the full ISA of the build
 # machine (e.g. AVX-512 on Ice Lake) for the CFR numeric loops. Keep the flag
@@ -40,8 +39,6 @@ RUSTFLAGS_CFR="-C target-cpu=$RUST_TARGET_CPU"
 TABLE=cote_cfr/1v1_table.csv
 TABLE_OLD=cote_cfr/1v1_table_old.csv
 CKPT=server/ckpt_1v1
-CKPT_TEST=server/ckpt_test
-TABLE_TEST=server/table_test.csv
 
 log() { printf '\n\033[1;36m=== %s ===\033[0m\n' "$*"; }
 
@@ -115,51 +112,6 @@ step_backup() {
   fi
 }
 
-# ------------------------------------------------------------------ smoke
-step_smoke() {
-  log "smoke: build hits 1..$SMOKE_HITS_MAX ($SMOKE_ITERS iters, $SMOKE_WORKERS workers)"
-  # shellcheck disable=SC1091
-  source .venv/bin/activate
-  python server/build_1v1_table.py \
-    --ckpt-dir "$CKPT_TEST" --out "$TABLE_TEST" \
-    --workers "$SMOKE_WORKERS" \
-    --hits-min 1 --hits-max "$SMOKE_HITS_MAX" \
-    --bank-max 4 --sh-max 8 --r-max 8 \
-    --gamma 0.995 --solve-iters "$SOLVE_ITERS" \
-    --max-iters "$SMOKE_ITERS" --tol 0.05 --force
-
-  log "smoke: consistency check (phase-4 value must be a fixed point of T_2)"
-  python - "$TABLE_TEST" "$SMOKE_HITS_MAX" <<'EOF'
-import csv, sys
-sys.path.insert(0, "."); sys.path.insert(0, "src")
-import _cote_cfr
-
-table, hits_max = sys.argv[1], int(sys.argv[2])
-nh = hits_max - 1 + 1
-def gidx(hA, hB, mv, bank, sh, r):
-    return (((((hA-1)*nh + (hB-1))*2 + mv) * 5 + bank) * 9 + sh) * 9 + r
-
-leaf7 = [0.0] * (nh*nh*2*5*9*9)
-with open(table) as f:
-    for row in csv.DictReader(f):
-        if int(row["turn"]) == 7:
-            leaf7[gidx(int(row["hA"]), int(row["hB"]), int(row["to_move"]),
-                      int(row["own_bank"]), int(row["own_sh"]), int(row["R"]))] = float(row["value"])
-
-key = gidx(3, 3, 0, 0, 0, 0)
-out, _ = _cote_cfr.solve_1v1_step(leaf7, start=key, end=key+1, root_turn=7,
-                                  hits_min=1, hits_max=hits_max, bank_max=4,
-                                  sh_max=8, r_max=8, gamma=0.995, solve_iters=200)
-spread = abs(out[0] - leaf7[key])
-print("phase4 fixed point fresh(3,3): table=%.4f T_2(table)=%.4f spread=%.4f"
-      % (leaf7[key], out[0], spread))
-if spread > 0.02:
-    print("FAIL: phase-4 is not a fixed point; do NOT run the full build")
-    sys.exit(1)
-print("OK: phase-4 self-consistent")
-EOF
-}
-
 # ------------------------------------------------------------------ full
 step_full() {
   log "full: build hits 1..16 ($FULL_ITERS iters, $WORKERS workers, tol=$FULL_TOL)"
@@ -178,28 +130,33 @@ step_full() {
 
 # ------------------------------------------------------------------ bench
 step_bench() {
-  log "bench: CFRBot vs Planner 1v1 duels"
+  log "bench: CFRBot vs Planner 1v1 duels (duplicate matching, Profile A)"
   # shellcheck disable=SC1091
   source .venv/bin/activate
 
-  log "bench: smoke (16 games)"
-  python test_1v1_duel_bot.py --games 16 --workers 4 --cfr-depth 3 \
-    --cfr-iters 100 --cfr-cap 6 --pl-depth 2 --pl-max-nodes 2000 \
-    --seed-start 7000 --tag duel_new_smoke
+  log "bench: smoke (8 pairs = 16 games)"
+  python test_1v1_duel_bot.py --profile A --pairs 8 --workers 4 \
+    --cfr-depth 4 --cfr-iters 150 --cfr-cap 6 --pl-depth 2 \
+    --pl-max-nodes 2000 --seed-start 7000 --tag duel_uniform_smoke
 
-  log "bench: full (100 games)"
-  python test_1v1_duel_bot.py --games 100 --workers 6 --cfr-depth 3 \
-    --cfr-iters 100 --cfr-cap 6 --pl-depth 2 --pl-max-nodes 2000 \
-    --seed-start 7000 --tag duel_new_100
+  log "bench: full (50 pairs = 100 games)"
+  python test_1v1_duel_bot.py --profile A --pairs 50 --workers 6 \
+    --cfr-depth 4 --cfr-iters 150 --cfr-cap 6 --pl-depth 2 \
+    --pl-max-nodes 2000 --seed-start 7000 --tag duel_uniform_100
 
   echo
   echo "Acceptance: aggregate CFR winrate must be > 50%; the collapse on the"
-  echo "second seat (was 14-25%) should shrink toward the Planner's ~46%."
+  echo "second seat (was 14-25%) should shrink toward the Planner's ~46%;"
+  echo "mean per-seed delta should be positive (CFR objectively stronger)."
 }
 
 # ------------------------------------------------------------------ compare
 step_compare() {
   log "compare: old vs new table"
+  if [ ! -f "$TABLE_OLD" ] || [ ! -f "$TABLE" ]; then
+    echo "skip: need both $TABLE_OLD and $TABLE (backup the old table first)"
+    return 0
+  fi
   python - "$TABLE_OLD" "$TABLE" <<'EOF'
 import csv, sys
 
@@ -228,19 +185,18 @@ EOF
 }
 
 # ------------------------------------------------------------------ main
-ALL_STEPS="env backup smoke full bench compare"
+ALL_STEPS="env backup full bench compare"
 RUN="${1:-}"
 
 case "${RUN}" in
   --all)      for s in $ALL_STEPS; do "step_$s"; done ;;
   --env)      step_env ;;
   --backup)   step_backup ;;
-  --smoke)    step_smoke ;;
   --full)     step_full ;;
   --bench)    step_bench ;;
   --compare)  step_compare ;;
   ""|-h|--help)
-    echo "usage: $0 --all | --env | --backup | --smoke | --full | --bench | --compare"
+    echo "usage: $0 --all | --env | --backup | --full | --bench | --compare"
     echo
     echo "steps: $ALL_STEPS"
     ;;

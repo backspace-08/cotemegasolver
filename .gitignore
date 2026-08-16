@@ -29,6 +29,7 @@ cote_cfr/Cargo.lock
 # Generated 1v1 table (built on the server, ~60MB) and its checkpoints
 cote_cfr/1v1_table.csv
 cote_cfr/1v1_table_old.csv
+cote_cfr/1v1_table_new.csv
 server/ckpt_1v1/
 server/ckpt_calib/
 server/ckpt_test/

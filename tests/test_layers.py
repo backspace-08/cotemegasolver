@@ -178,34 +178,36 @@ class LayerTests(unittest.TestCase):
 
 
 class BeliefSharpnessTests(unittest.TestCase):
-    """The split prior must actually learn, while keeping every world live."""
+    """Max-entropy uniform prior + pruning by public evidence only."""
 
-    def test_prior_follows_observed_split_behaviour(self):
-        # An opponent that spends its whole budget on attacks and bonuses, and
-        # is then observed to have held zero shields, is a banker. The belief
-        # must concentrate on "few shields", not stay near-uniform: a flat
-        # prior is what stopped the planner from punishing a banking opponent.
-        banker = OpponentModel()
-        for turn in (1, 3, 5):
-            banker.observe_turn(turn, base_budget(turn), attacks=0)
-            banker.observe_our_attack(1, 0)
-        banker.observe_turn(7, base_budget(7), attacks=0)
-        distribution = banker.shield_distribution()
-        self.assertGreater(distribution.get(0, 0.0), 0.5)
-        self.assertGreater(distribution[0], distribution.get(4, 0.0) * 5)
+    def test_prior_is_max_entropy_uniform(self):
+        # A fresh opponent turn leaves every legal split of the remainder with
+        # equal weight 1/(R+1): no type hypotheses, no behavioural read.
+        model = OpponentModel()
+        model.observe_turn(7, base_budget(7), attacks=0)  # remainder 4
+        distribution = model.shield_distribution()
+        self.assertAlmostEqual(distribution.get(0, 0.0), 0.2)
+        self.assertAlmostEqual(distribution.get(4, 0.0), 0.2)
+        self.assertAlmostEqual(sum(distribution.values()), 1.0)
 
-    def test_prior_keeps_every_legal_split_live(self):
+    def test_public_evidence_narrows_current_remainder(self):
+        # observe_our_attack pins the shield count of the CURRENT remainder:
+        # blocked < attacks leaves only the exact split, blocked == attacks
+        # keeps only splits with shields >= attacks.
+        model = OpponentModel()
+        model.observe_turn(7, base_budget(7), attacks=0)  # remainder 4
+        model.observe_our_attack(3, 2)                    # exact pin: sh == 2
+        worlds = model.worlds()
+        self.assertEqual(len(worlds), 1)
+        self.assertEqual((worlds[0].shields, worlds[0].bank), (2, 2))
+
+    def test_prior_keeps_every_legal_split_live_before_evidence(self):
         # AGENT.md §9: splits are pruned by public facts, never by assumption.
-        # However confident the behavioural read is, no legal world may be
-        # assigned zero probability.
-        banker = OpponentModel()
-        for turn in (1, 3, 5):
-            banker.observe_turn(turn, base_budget(turn), attacks=0)
-            banker.observe_our_attack(1, 0)
-        banker.observe_turn(7, base_budget(7), attacks=0)
-        distribution = banker.shield_distribution()
-        remainder = base_budget(7)
-        for shields in range(remainder + 1):
+        # Before any evidence, every legal split of the remainder stays live.
+        model = OpponentModel()
+        model.observe_turn(7, base_budget(7), attacks=0)  # remainder 4
+        distribution = model.shield_distribution()
+        for shields in range(5):
             self.assertGreater(distribution.get(shields, 0.0), 0.0)
 
 
