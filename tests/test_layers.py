@@ -210,6 +210,19 @@ class BeliefSharpnessTests(unittest.TestCase):
         for shields in range(5):
             self.assertGreater(distribution.get(shields, 0.0), 0.0)
 
+    def test_dirichlet_memory_concentrates_on_repeated_d4(self):
+        # A turtle that blocks every attack with a full d4 must be read as a
+        # shielder: after several full blocks the prior over R=4 concentrates
+        # on (sh=4, bank=0) instead of resetting to uniform every turn.
+        model = OpponentModel()
+        for _ in range(3):
+            model.observe_turn(7, base_budget(7), attacks=0)  # remainder 4
+            model.observe_our_attack(4, 4)                    # full block
+        distribution = model.shield_distribution()
+        self.assertGreater(distribution.get(4, 0.0), 0.7)
+        self.assertGreater(distribution[4],
+                           distribution.get(0, 0.0) * 10)
+
 
 class LossGateTests(unittest.TestCase):
     """The safety gate must see bursts paid for out of a believed bank."""

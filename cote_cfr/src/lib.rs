@@ -897,6 +897,74 @@ impl MicroSolver {
         (probs, self.avg_profile_value())
     }
 
+    /// Opponent's average-strategy reach over their NEXT hidden split
+    /// (shields, bank), set by their first decision in this subgame. This is
+    /// the Continuum/DeepStack reach that becomes the belief prior at the next
+    /// resolve (Continual Subgame Resolving). Computed under the AVERAGE
+    /// strategy of both players; the opponent's first action determines their
+    /// new split (defends -> shields, bonuses -> bank).
+    fn opponent_reach(&self) -> HashMap<(i32, i32), f64> {
+        let n = self.states.len();
+        let mut sigs: Vec<Vec<f64>> = Vec::with_capacity(self.infos.len());
+        for info in &self.infos {
+            let na = info.n_acts;
+            let total: f64 = info.avg.iter().sum();
+            if total > 0.0 {
+                sigs.push(info.avg.iter().map(|x| x / total).collect());
+            } else {
+                sigs.push(vec![1.0 / na as f64; na]);
+            }
+        }
+        let mut ra = vec![0.0f64; n];
+        let mut rb = vec![0.0f64; n];
+        for &(ri, w) in &self.roots {
+            if self.states[ri].to_move == 0 {
+                ra[ri] = 1.0;
+                rb[ri] = w;
+            } else {
+                rb[ri] = 1.0;
+                ra[ri] = w;
+            }
+        }
+        for i in 0..n {
+            if self.terminals[i].is_some() || self.depths[i] >= self.depth {
+                continue;
+            }
+            let sig = &sigs[self.info_id[i]];
+            for (a, &ci) in self.children[i].iter().enumerate() {
+                let p = sig[a];
+                if self.states[i].to_move == 0 {
+                    ra[ci] += ra[i] * p;
+                    rb[ci] += rb[i];
+                } else {
+                    rb[ci] += rb[i] * p;
+                    ra[ci] += ra[i];
+                }
+            }
+        }
+        let mut out: HashMap<(i32, i32), f64> = HashMap::new();
+        for i in 0..n {
+            if self.depths[i] != 1 || self.terminals[i].is_some()
+                || self.depths[i] >= self.depth {
+                continue;
+            }
+            let tm = self.states[i].to_move;
+            let (self_r, opp_r) = if tm == 0 { (ra[i], rb[i]) } else { (rb[i], ra[i]) };
+            let w_line = self_r * opp_r;
+            if w_line <= 0.0 {
+                continue;
+            }
+            let sig = &sigs[self.info_id[i]];
+            for (a, &ci) in self.children[i].iter().enumerate() {
+                let st = &self.states[ci];
+                let (sh_new, bank_new) =
+                    if tm == 0 { (st.sh_a, st.bank_a) } else { (st.sh_b, st.bank_b) };
+                *out.entry((sh_new, bank_new)).or_insert(0.0) += w_line * sig[a];
+            }
+        }
+        out
+    }
+
     fn rebuild(&mut self) {
         self.roots.clear();
         self.states.clear();
@@ -1222,6 +1290,12 @@ impl MicroTree {
             .map(|ac| vec![ac.a, ac.d, ac.b, ac.sw.map(|x| x as i32).unwrap_or(-1)])
             .collect();
         (actions, probs, value)
+    }
+
+    /// Opponent reach over their next (shields, bank) split under the average
+    /// strategy - the belief prior for Continual Subgame Resolving.
+    fn opponent_reach(&self) -> HashMap<(i32, i32), f64> {
+        self.inner.opponent_reach()
     }
 }
 

@@ -62,7 +62,7 @@ def _encode_state(state, opp_bank, opp_sh):
 
 
 class CFRBot:
-    def __init__(self, depth=4, iters=150, cap=6, gamma=0.995,
+    def __init__(self, depth=3, iters=120, cap=6, gamma=0.995,
                  temperature=0.0, rng=None, value_leaf=None, prune_after=20,
                  use_opening_book=False):
         self.depth = depth
@@ -80,6 +80,7 @@ class CFRBot:
         # optional belief-conditioned value network for the leaves (ReBeL/DeepStack)
         self.value_leaf = value_leaf
         self.model = OpponentModel()
+        self._reach = None
         self._observed_turns = 0
         self.last_report = {}
 
@@ -115,11 +116,15 @@ class CFRBot:
         worlds = self.model.worlds() or (WorldProxy(0, 0, 1.0),)
         team_a = _team_of(state.player)
         team_b = _team_of(state.opponent)
-        roots = [(_encode_state(state, w.bank, w.shields), w.probability)
-                 for w in worlds]
+        # Continual Subgame Resolving (DeepStack/Burch reach): the root belief
+        # is the opponent's average-strategy reach from the PREVIOUS resolve,
+        # filtered to the current public remainder R, else the uniform fallback
+        # (clean infoset = uniform + public evidence).
+        r_opp = worlds[0].shields + worlds[0].bank
+        roots = self._belief_roots(state, r_opp, worlds)
         turn = state.turn
-        # Continual Subgame Resolving: turns 1..6 reach the phase-4 fixed point
-        # (turn >= 7); turn >= 7 re-solves a shallow phase-4 lookahead.
+        # Turns 1..6 reach the phase-4 fixed point (turn >= 7); turn >= 7
+        # re-solves a shallow phase-4 lookahead (even depth = whole rounds).
         depth = 7 - turn if turn < 7 else self.depth
         probe = None
         if self.use_opening_book and self.value_leaf is None:
@@ -133,7 +138,6 @@ class CFRBot:
         override = []
         if self.value_leaf is not None:
             leaves = mt.leaf_states()
-            r_opp = worlds[0].shields + worlds[0].bank
             belief_vec = [0.0] * (r_opp + 1)
             for w in worlds:
                 belief_vec[w.shields] += w.probability
@@ -141,9 +145,43 @@ class CFRBot:
                                                 belief_vec, bot_side=0)
         mt.solve(self.iters, self.gamma, override, self.prune_after)
         actions, probs, value = mt.strategy()
+        # store the opponent reach profile for the next resolve
+        self._reach = self._normalized_reach(mt.opponent_reach())
         if probe is not None and len(_OPENING_BOOK) < _OPENING_BOOK_MAX:
             _OPENING_BOOK[probe] = (actions, probs, value)
         return self._play(actions, probs, value, worlds)
+
+    def _belief_roots(self, state, r_opp, worlds):
+        """Root belief from the incoming reach vector, hard-filtered by the
+        same observation-consistency facts as the infoset prior, else uniform
+        fallback."""
+        pin, lb, bank = (self.model._shield_pin, self.model._shield_lb,
+                         self.model._bank_pin)
+        if self._reach:
+            kept = {k: v for k, v in self._reach.items()
+                    if k[0] + k[1] == r_opp}
+            if kept:
+                if pin is not None and pin[0] == r_opp:
+                    kept = {k: v for k, v in kept.items() if k[0] == pin[1]}
+                elif lb is not None and lb[0] == r_opp:
+                    kept = {k: v for k, v in kept.items() if k[0] >= lb[1]}
+                if bank is not None and bank[0] == r_opp:
+                    kept = {k: v for k, v in kept.items() if k[1] == bank[1]}
+                total = sum(kept.values())
+                if total > 0.0:
+                    return [(_encode_state(state, bk, sh), v / total)
+                            for (sh, bk), v in kept.items()]
+        return [(_encode_state(state, w.bank, w.shields), w.probability)
+                for w in worlds]
+
+    @staticmethod
+    def _normalized_reach(reach):
+        if not reach:
+            return None
+        total = sum(reach.values())
+        if total <= 0.0:
+            return None
+        return {k: v / total for k, v in reach.items()}
 
     def _play(self, actions, probs, value, worlds):
         idx = _pick(probs, self.rng)
@@ -205,3 +243,4 @@ def _pick(probs, rng):
         if p > best:
             best, best_i = p, i
     return best_i
+

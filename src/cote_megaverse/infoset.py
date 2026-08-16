@@ -70,6 +70,15 @@ class OpponentModel:
     records: list[TurnRecord] = field(default_factory=list)
     _candidates: dict[tuple[int, int], float] = field(
         default_factory=lambda: {(0, 0): 1.0})
+    # Observation Consistency Filtering (persistent, survives observe_turn):
+    # a fully/partially revealed attack pins or lower-bounds the shields of
+    # the split that was attacked; a revealed budget pins the bank. Each is
+    # tagged with the remainder it constrains and applied in `_prior` only to
+    # a split of that same remainder, so evidence is never wiped by the prior
+    # reset and a 0-damage attack forces belief to (R, 0).
+    _shield_pin: tuple[int, int] | None = None   # (remainder, shields) exact
+    _shield_lb: tuple[int, int] | None = None    # (remainder, min_shields)
+    _bank_pin: tuple[int, int] | None = None     # (remainder, bank)
 
     # ---------------------------------------------------------------- observe
 
@@ -110,8 +119,14 @@ class OpponentModel:
             return
         if blocked < attacks:
             self._restrict(lambda shields, bank: shields == blocked)
+            if self.records:
+                self._shield_pin = (self.records[-1].remainder, blocked)
+                self._shield_lb = None
         else:
             self._restrict(lambda shields, bank: shields >= attacks)
+            if self.records:
+                self._shield_lb = (self.records[-1].remainder, attacks)
+                self._shield_pin = None
 
     def expire_shields(self):
         """Clear held shields after our allocation resolved. Bank survives."""
@@ -165,20 +180,30 @@ class OpponentModel:
     # ---------------------------------------------------------------- helpers
 
     def _prior(self, remainder: int) -> dict[tuple[int, int], float]:
-        """Max-entropy uniform prior over the splits of ``remainder``.
+        """Max-entropy uniform prior over the splits of ``remainder``, hard-
+        filtered by observation-consistency facts.
 
-        Strictly identical to the table builder's ``build_belief_roots``: every
-        legal split (shields, bank) with shields + bank == remainder carries an
-        equal weight of 1/(R+1) (banking is capped, so R > MAX_BONUS yields
-        1/(MAX_BONUS+1) splits on both sides). No type hypotheses, no
-        desperation, no magic weights. Evidence is applied separately via
-        ``_restrict`` on public facts only.
+        Every legal split carries weight 1/(R+1) - strictly identical to the
+        table builder's ``build_belief_roots``. THEN any split inconsistent
+        with a revealed shield pin / lower bound or a revealed bank is hard-
+        zeroed (likelihood = 0) and the rest renormalized - e.g. an a4 that
+        deals 0 damage against R=4 forces belief to (4, 0) exactly.
         """
         splits = legal_splits(remainder)
         if len(splits) == 1:
             return {splits[0]: 1.0}
         w = 1.0 / len(splits)
-        return {split: w for split in splits}
+        cand = {s: w for s in splits}
+        if self._shield_pin is not None and self._shield_pin[0] == remainder:
+            cand = {k: v for k, v in cand.items() if k[0] == self._shield_pin[1]}
+        elif self._shield_lb is not None and self._shield_lb[0] == remainder:
+            cand = {k: v for k, v in cand.items() if k[0] >= self._shield_lb[1]}
+        if self._bank_pin is not None and self._bank_pin[0] == remainder:
+            cand = {k: v for k, v in cand.items() if k[1] == self._bank_pin[1]}
+        if not cand:
+            return {s: w for s in splits}
+        tot = sum(cand.values())
+        return {k: v / tot for k, v in cand.items()}
 
     def _restrict(self, predicate):
         """Keep only worlds consistent with new evidence."""
@@ -191,9 +216,12 @@ class OpponentModel:
         """A revealed budget proves the bank, hence the earlier split."""
         if not self.records:
             return
+        prev_rem = self.records[-1].remainder
         self._restrict(lambda shields, bank: bank == revealed_bank)
-        surviving = [key for key in self._candidates if key[1] == revealed_bank]
-        if len(surviving) == 1:
-            shields = surviving[0][0]
+        consistent = [key for key in self._candidates if key[1] == revealed_bank]
+        if len(consistent) == 1:
+            shields = consistent[0][0]
             self.records[-1] = TurnRecord(
                 **{**self.records[-1].__dict__, "confirmed_shields": shields})
+        if consistent:
+            self._bank_pin = (prev_rem, revealed_bank)

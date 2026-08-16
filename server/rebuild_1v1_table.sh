@@ -136,12 +136,12 @@ step_bench() {
 
   log "bench: smoke (8 pairs = 16 games)"
   python test_1v1_duel_bot.py --profile A --pairs 8 --workers 4 \
-    --cfr-depth 4 --cfr-iters 150 --cfr-cap 6 --pl-depth 2 \
+    --cfr-depth 3 --cfr-iters 120 --cfr-cap 6 --pl-depth 2 \
     --pl-max-nodes 2000 --seed-start 7000 --tag duel_uniform_smoke
 
   log "bench: full (50 pairs = 100 games)"
   python test_1v1_duel_bot.py --profile A --pairs 50 --workers 6 \
-    --cfr-depth 4 --cfr-iters 150 --cfr-cap 6 --pl-depth 2 \
+    --cfr-depth 3 --cfr-iters 120 --cfr-cap 6 --pl-depth 2 \
     --pl-max-nodes 2000 --seed-start 7000 --tag duel_uniform_100
 
   echo
@@ -202,3 +202,4 @@ case "${RUN}" in
     ;;
   *) echo "unknown step: $1"; exit 1 ;;
 esac
+

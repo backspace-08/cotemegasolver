@@ -127,9 +127,9 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--max-half-turns", type=int, default=40,
                     help="turn cap; reaching it is a draw (0.0)")
-    ap.add_argument("--cfr-depth", type=int, default=4,
+    ap.add_argument("--cfr-depth", type=int, default=3,
                     help="phase-4 (turn>=7) resolve depth; even depth = whole rounds")
-    ap.add_argument("--cfr-iters", type=int, default=100)
+    ap.add_argument("--cfr-iters", type=int, default=120)
     ap.add_argument("--cfr-prune-after", type=int, default=20)
     ap.add_argument("--cfr-temperature", type=float, default=1.0,
                     help="sample actions from the CFR strategy (1.0); 0 = argmax")
@@ -202,3 +202,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
