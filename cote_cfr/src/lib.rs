@@ -129,6 +129,7 @@ struct Trunk {
     team_a: Vec<(u8, i32, i32)>, // (type, atk, max_hp_units)
     team_b: Vec<(u8, i32, i32)>,
     turn_cap: i32,
+    compress: bool, // E>=6: cap candidate splits to ~10-12 macro-actions per target
 }
 
 impl Trunk {
@@ -137,7 +138,14 @@ impl Trunk {
             team_a,
             team_b,
             turn_cap: start_turn + cap,
+            compress: false,
         }
+    }
+
+    fn new_compressed(team_a: Vec<(u8, i32, i32)>, team_b: Vec<(u8, i32, i32)>, cap: i32, start_turn: i32) -> Self {
+        let mut t = Self::new(team_a, team_b, cap, start_turn);
+        t.compress = true;
+        t
     }
 
     /// Python round() semantics: round half to even (rules.py rounded_damage).
@@ -197,8 +205,11 @@ impl Trunk {
     fn actions(&self, s: &State) -> Vec<Action> {
         let order = if s.to_move == 0 { &s.order_a } else { &s.order_b };
         let bgt = self.budget(s);
-        let mut out = Vec::new();
         let switches: Vec<Option<u8>> = std::iter::once(None).chain(order.iter().skip(1).map(|&c| Some(c))).collect();
+        if self.compress {
+            return self.actions_compressed(s, &switches, bgt);
+        }
+        let mut out = Vec::new();
         for sw in switches {
             let rem = bgt - if sw.is_some() { 1 } else { 0 };
             for a in 0..=rem {
@@ -208,6 +219,48 @@ impl Trunk {
                         out.push(Action { a, d, b, sw });
                     }
                 }
+            }
+        }
+        out
+    }
+
+    /// 3v3 action-grid compression: for each target (stay or switch k), emit a
+    /// compact macro set (~10-12 actions): the three pure corners plus the
+    /// attack/shield, attack/bank and shield/bank trade-off lines. Keeps the
+    /// branch factor tractable for E >= 6 (full 3v3 rosters).
+    fn actions_compressed(&self, s: &State, switches: &[Option<u8>], bgt: i32) -> Vec<Action> {
+        let mut out = Vec::new();
+        for &sw in switches {
+            let e = bgt - if sw.is_some() { 1 } else { 0 };
+            if e <= 0 {
+                continue;
+            }
+            // three pure corners
+            if e <= MAX_BANK {
+                out.push(Action { a: 0, d: 0, b: e, sw });
+            }
+            out.push(Action { a: e, d: 0, b: 0, sw });
+            out.push(Action { a: 0, d: e, b: 0, sw });
+            // attack/defense trade-off line
+            for a in [1, e / 2, e - 1] {
+                if a <= 0 || a >= e {
+                    continue;
+                }
+                out.push(Action { a, d: e - a, b: 0, sw });
+            }
+            // attack/bank trade-off line
+            for a in [1, e / 2, e - 1] {
+                if a <= 0 || a >= e || e - a > MAX_BANK {
+                    continue;
+                }
+                out.push(Action { a, d: 0, b: e - a, sw });
+            }
+            // defense/bank trade-off line
+            for d in [1, e / 2, e - 1] {
+                if d <= 0 || d >= e || e - d > MAX_BANK {
+                    continue;
+                }
+                out.push(Action { a: 0, d, b: e - d, sw });
             }
         }
         out
@@ -1218,7 +1271,7 @@ struct MicroTree {
 #[pymethods]
 impl MicroTree {
     #[new]
-    #[pyo3(signature = (team_a, team_b, states, depth=3, cap=6, start_turn=1))]
+    #[pyo3(signature = (team_a, team_b, states, depth=3, cap=6, start_turn=1, compress=false))]
     fn new(
         team_a: Vec<(u8, i32, i32)>,
         team_b: Vec<(u8, i32, i32)>,
@@ -1226,6 +1279,7 @@ impl MicroTree {
         depth: u8,
         cap: i32,
         start_turn: i32,
+        compress: bool,
     ) -> PyResult<Self> {
         let mut roots = Vec::with_capacity(states.len());
         let mut wsum = 0.0;
@@ -1242,7 +1296,11 @@ impl MicroTree {
         for (_, w) in roots.iter_mut() {
             *w /= wsum;
         }
-        let trunk = Trunk::new(team_a, team_b, cap, start_turn);
+        let trunk = if compress {
+            Trunk::new_compressed(team_a, team_b, cap, start_turn)
+        } else {
+            Trunk::new(team_a, team_b, cap, start_turn)
+        };
         Ok(MicroTree { inner: MicroSolver::new(trunk, roots, depth, 0.995) })
     }
 

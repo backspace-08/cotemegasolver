@@ -9,6 +9,7 @@ import json
 import os
 import random
 import sys
+import time
 from dataclasses import replace
 from multiprocessing import Pool
 
@@ -33,9 +34,13 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
     if net:
         from server.value_leaf import ValueLeaf
         value_leaf = ValueLeaf(net)
+    else:
+        from cote_megaverse.chain_leaf import ChainLeaf
+        value_leaf = ChainLeaf()
     cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap,
-                 value_leaf=value_leaf)
+                 value_leaf=value_leaf, compress=True)
     pl = Planner(depth=pl_depth, max_nodes=pl_max_nodes)
+    lat = []
     try:
         for _ in range(80):
             if state.player.lost or state.opponent.lost:
@@ -43,7 +48,9 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
             if state.player_to_move:
                 before = state
                 planning = GameState(state.player, state.opponent, state.turn, True)
+                t0 = time.time()
                 move = cfr.choose(planning)
+                lat.append((time.time() - t0) * 1000)
                 state = apply(state, move)
                 # The planner's shields the bot's attack met are revealed in
                 # full on every resolution (RULES.md §8).
@@ -66,10 +73,16 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
             traceback.print_exc(file=fh)
         raise
     if state.opponent.lost:
-        return {"seed": seed, "new_first": new_first, "winner": "LEFT"}
+        return {"seed": seed, "new_first": new_first, "winner": "LEFT",
+                "half_turns": state.turn, "lat_ms": (sum(lat) / len(lat) if lat else 0.0),
+                "max_lat_ms": max(lat) if lat else 0.0}
     if state.player.lost:
-        return {"seed": seed, "new_first": new_first, "winner": "RIGHT"}
-    return {"seed": seed, "new_first": new_first, "winner": "DRAW"}
+        return {"seed": seed, "new_first": new_first, "winner": "RIGHT",
+                "half_turns": state.turn, "lat_ms": (sum(lat) / len(lat) if lat else 0.0),
+                "max_lat_ms": max(lat) if lat else 0.0}
+    return {"seed": seed, "new_first": new_first, "winner": "DRAW",
+            "half_turns": state.turn, "lat_ms": (sum(lat) / len(lat) if lat else 0.0),
+            "max_lat_ms": max(lat) if lat else 0.0}
 
 
 def _worker(task):
@@ -91,8 +104,12 @@ def main():
     ap.add_argument("--net", default=None, help="value-network .pt for leaves")
     ap.add_argument("--tag", default="cfr_vs_planner")
     a = ap.parse_args()
-    tasks = [(a.seed_start + i, (i % 2 == 0), a.cfr_depth, a.cfr_iters,
-              a.cfr_cap, a.pl_depth, a.pl_max_nodes, a.net) for i in range(a.games)]
+    tasks = []
+    for i in range(a.games // 2):
+        seed = a.seed_start + i
+        for seat in (True, False):
+            tasks.append((seed, seat, a.cfr_depth, a.cfr_iters,
+                          a.cfr_cap, a.pl_depth, a.pl_max_nodes, a.net))
     with Pool(a.workers) as pool:
         results = list(pool.imap_unordered(_worker, tasks))
     out = os.path.join(BASE, "runs", "botvbot", f"{a.tag}.json")
@@ -103,13 +120,28 @@ def main():
     lw = sum(1 for r in results if r["winner"] == "LEFT")
     rw = sum(1 for r in results if r["winner"] == "RIGHT")
     dr = sum(1 for r in results if r["winner"] == "DRAW")
-    print(f"tag={a.tag} CFR-vs-Planner games={n}  "
+    score = {"LEFT": 1.0, "RIGHT": -1.0, "DRAW": 0.0}
+    by_seed = {}
+    for r in results:
+        by_seed[r["seed"]] = by_seed.get(r["seed"], 0.0) + score[r["winner"]]
+    deltas = list(by_seed.values())
+    ht = [r["half_turns"] for r in results]
+    print(f"tag={a.tag} CFR-vs-Planner games={n} ({n//2} pairs x 2 seats)  "
           f"CFR={lw} Planner={rw} DRAW={dr}  CFR-winrate={100.0*lw/n:.1f}%")
+    print(f"  mean delta per seed = {sum(deltas)/len(deltas):+.3f}  "
+          f"(0=equal, +2=sweep)")
     for seat in (True, False):
         rs = [r for r in results if r["new_first"] == seat]
         wn = sum(1 for r in rs if r["winner"] == "LEFT")
         label = "CFR-first" if seat else "Planner-first"
         print(f"  {label}: CFR-wins {wn}/{len(rs)} = {100.0*wn/len(rs):.1f}%")
+    if ht:
+        print(f"  avg half_turns={sum(ht)/len(ht):.1f}  min={min(ht)} max={max(ht)}  "
+              f"draws={100.0*dr/n:.1f}%")
+    lats = [r["lat_ms"] for r in results if r.get("lat_ms")]
+    if lats:
+        print(f"  CFR avg lat={sum(lats)/len(lats):.0f}ms  "
+              f"max lat={max(r['max_lat_ms'] for r in results):.0f}ms")
     print(f"results -> {out}")
 
 

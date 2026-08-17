@@ -64,7 +64,7 @@ def _encode_state(state, opp_bank, opp_sh):
 class CFRBot:
     def __init__(self, depth=3, iters=120, cap=6, gamma=0.995,
                  temperature=0.0, rng=None, value_leaf=None, prune_after=20,
-                 use_opening_book=False):
+                 use_opening_book=False, compress=False):
         self.depth = depth
         self.iters = iters
         self.cap = cap
@@ -79,6 +79,7 @@ class CFRBot:
         self.use_opening_book = use_opening_book
         # optional belief-conditioned value network for the leaves (ReBeL/DeepStack)
         self.value_leaf = value_leaf
+        self.compress = compress
         self.model = OpponentModel()
         self._reach = None
         self._observed_turns = 0
@@ -123,9 +124,12 @@ class CFRBot:
         r_opp = worlds[0].shields + worlds[0].bank
         roots = self._belief_roots(state, r_opp, worlds)
         turn = state.turn
-        # Turns 1..6 reach the phase-4 fixed point (turn >= 7); turn >= 7
-        # re-solves a shallow phase-4 lookahead (even depth = whole rounds).
-        depth = 7 - turn if turn < 7 else self.depth
+        # 3v3: fixed depth (user-chosen), compressed action grid for E>=6.
+        # 1v1: Continual Subgame Resolving - turns 1..6 reach phase-4, turn>=7
+        # re-solves a shallow phase-4 lookahead.
+        is_3v3 = len(state.player.characters) > 1 or len(state.opponent.characters) > 1
+        depth = self.depth if is_3v3 else (7 - turn if turn < 7 else self.depth)
+        compress = self.compress or is_3v3
         probe = None
         if self.use_opening_book and self.value_leaf is None:
             probe = (tuple(team_a), tuple(team_b), turn,
@@ -134,7 +138,7 @@ class CFRBot:
             if hit is not None:
                 return self._play(hit[0], hit[1], hit[2], worlds)
         mt = _cote_cfr.MicroTree(team_a, team_b, roots, depth=depth,
-                                 cap=self.cap, start_turn=turn)
+                                 cap=self.cap, start_turn=turn, compress=compress)
         override = []
         if self.value_leaf is not None:
             leaves = mt.leaf_states()
