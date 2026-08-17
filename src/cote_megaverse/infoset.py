@@ -98,8 +98,14 @@ class OpponentModel:
         self.records.append(TurnRecord(
             turn=turn, budget=budget, attacks=attacks, switched=switched,
             remainder=remainder, revealed_bank=revealed_bank))
-        # A fresh remainder replaces the previous hidden state entirely: old
-        # shields have expired and the old bank was just spent.
+        # Shields are turn-local: a new allocation discards any previous shield
+        # observation - the old shields expired when we attacked, and on a
+        # switch the old fighter leaves the field (bench enters with 0 shields).
+        # A shield pin is strictly a single-turn observation of a SPECIFIC past
+        # allocation, never a mapping `remainder -> shields` for future turns.
+        self._shield_pin = None
+        self._shield_lb = None
+        # The team bank persists across turns and switches: `_bank_pin` stays.
         self._candidates = self._prior(remainder)
 
     def observe_our_attack(self, attacks: int, blocked: int):

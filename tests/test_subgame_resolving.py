@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from cote_megaverse.rules import (  # noqa: E402
     GameState, Side, Character, Type, apply)
 from cote_megaverse.cfr_bot import CFRBot  # noqa: E402
+from cote_megaverse.infoset import OpponentModel  # noqa: E402
 
 HP, ATK = 24000, 1500
 
@@ -96,6 +97,48 @@ class LethalBurstDefenseTests(unittest.TestCase):
         self.assertGreaterEqual(move.defends, 4,
                                 "must shield >=4 vs imminent a8 burst, got (%d,%d,%d)"
                                 % (move.attacks, move.defends, move.bonuses))
+
+
+class ShieldPinLifetimeTests(unittest.TestCase):
+    """Shield pins are turn-local: discarded on any new opponent allocation."""
+
+    def test_shield_pin_discarded_on_new_turn_and_switch(self):
+        m = OpponentModel()
+        m.observe_turn(7, 4, 0)            # opponent leaves remainder 4
+        m.observe_our_attack(5, 4)         # we attacked, 4 blocked -> pin
+        self.assertEqual(m._shield_pin, (4, 4))
+
+        # a new allocation discards the SHIELD pin (shields are turn-local).
+        # Here the opponent again leaves remainder 4 with a revealed bank of 0,
+        # so the persistent team-bank filter still narrows to (4,0) - that is
+        # legitimate bank evidence, NOT the stale shield observation.
+        m.observe_turn(8, 4, 0)
+        self.assertIsNone(m._shield_pin)     # shield pin wiped
+        self.assertIsNone(m._shield_lb)      # shield lb wiped
+        self.assertIsNotNone(m._bank_pin)    # team bank survives
+        self.assertEqual(m.shield_distribution().get(4, 0.0), 1.0)  # bank filter
+
+        # a switch also discards the shield pin (old fighter's shields vanish).
+        # Switch budget is E-1: reveal bank 0 on a remainder of 4.
+        m2 = OpponentModel()
+        m2.observe_turn(7, 4, 0)
+        m2.observe_our_attack(5, 4)
+        self.assertEqual(m2._shield_pin, (4, 4))
+        m2.observe_turn(8, 5, 0, switched=True)   # switch costs 1 -> remainder 4
+        self.assertIsNone(m2._shield_pin)
+        self.assertIsNone(m2._shield_lb)
+
+    def test_bank_pin_survives_new_turn(self):
+        # reveal bank on turn 8: previous remainder 4, opponent held bank 1.
+        # The pin tracks the MOST RECENT remainder (shield pins are wiped, but
+        # the team bank persists and is re-tagged on every reveal).
+        m = OpponentModel()
+        m.observe_turn(7, 4, 0)            # remainder 4 (candidates (4,0)..(0,4))
+        m.observe_turn(8, 5, 0)            # budget 5 = base 4 + bank 1 (revealed)
+        self.assertEqual(m._bank_pin, (4, 1))  # pinned to prev remainder 4
+        # the shield pin is gone but the bank pin is NOT wiped on a new turn
+        self.assertIsNotNone(m._bank_pin)
+        self.assertIsNone(m._shield_pin)
 
 
 if __name__ == "__main__":

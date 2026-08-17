@@ -525,6 +525,21 @@ struct MicroSolver {
     mask: Vec<Vec<bool>>,
     prune_after: usize,
     iter_count: usize,
+    // Diagnostic telemetry (enabled via `--telemetry`/stats flag; off by default).
+    stats: Option<MicroStats>,
+}
+
+/// Per-resolution diagnostic counters (exposed to Python for profiling).
+#[derive(Clone, Default)]
+struct MicroStats {
+    depth_visits: [u64; 5], // index 1..=4 -> node visits per depth level
+    n_leaves: u64,
+    ns_action_gen: u64,
+    ns_leaf_eval: u64,
+    ns_regret: u64,
+    n_alloc_fullkey: u64,
+    n_alloc_actions: u64,
+    n_alloc_children: u64,
 }
 
 impl MicroSolver {
@@ -558,6 +573,7 @@ impl MicroSolver {
             mask: Vec::new(),
             prune_after: 0,
             iter_count: 0,
+            stats: None,
         };
         s.build();
         s
@@ -596,11 +612,27 @@ impl MicroSolver {
         }
 
         while let Some(i) = queue.pop_front() {
-            if self.terminals[i].is_some() || self.depths[i] >= self.depth {
+            if self.terminals[i].is_some() {
                 continue;
             }
+            let d = self.depths[i] as usize;
+            if d >= self.depth as usize {
+                continue;
+            }
+            if let Some(st) = self.stats.as_mut() {
+                st.n_alloc_fullkey += 1; // full_key[i].clone()
+            }
             let key = (self.states[i].to_move as u8, self.full_key[i].clone());
-            let mut acts = self.trunk.actions(&self.states[i]);
+            let (acts, act_ns) = {
+                let t0 = std::time::Instant::now();
+                let a = self.trunk.actions(&self.states[i]);
+                (a, t0.elapsed().as_nanos() as u64)
+            };
+            if let Some(st) = self.stats.as_mut() {
+                st.ns_action_gen += act_ns;
+                st.n_alloc_actions += 1;
+            }
+            let mut acts = acts;
             if let Some(mask) = self.keep.get(&key) {
                 acts = acts
                     .into_iter()
@@ -829,7 +861,13 @@ impl MicroSolver {
             if let Some(t) = self.terminals[i] {
                 self.v[i] = t;
             } else if self.depths[i] >= self.depth {
-                self.v[i] = self.leaf_value(i);
+                let t0 = std::time::Instant::now();
+                let v = self.leaf_value(i);
+                if let Some(st) = self.stats.as_mut() {
+                    st.ns_leaf_eval += t0.elapsed().as_nanos() as u64;
+                    st.n_leaves += 1;
+                }
+                self.v[i] = v;
             } else {
                 let iid = self.info_id[i];
                 let sig = &sigs[iid];
@@ -852,6 +890,7 @@ impl MicroSolver {
         for row in self.cfv_contrib.iter_mut() {
             row.fill(0.0);
         }
+        let regret_t0 = std::time::Instant::now();
         for i in 0..n {
             if self.terminals[i].is_some() || self.depths[i] >= self.depth {
                 continue;
@@ -891,6 +930,9 @@ impl MicroSolver {
                 self.infos[iid].regret[a] = r.max(0.0);
                 self.infos[iid].avg[a] += self.reach_self_sum[iid] * sigs[iid][a];
             }
+        }
+        if let Some(st) = self.stats.as_mut() {
+            st.ns_regret += regret_t0.elapsed().as_nanos() as u64;
         }
     }
 
@@ -1327,10 +1369,13 @@ impl MicroTree {
     }
 
     /// Run CFR with the given leaf values (flat state -> value).
-    #[pyo3(signature = (iters, gamma=0.995, override_=vec![], prune_after=0))]
-    fn solve(&mut self, iters: usize, gamma: f64, override_: Vec<(Vec<i32>, f64)>, prune_after: usize) {
+    #[pyo3(signature = (iters, gamma=0.995, override_=vec![], prune_after=0, telemetry=false))]
+    fn solve(&mut self, iters: usize, gamma: f64, override_: Vec<(Vec<i32>, f64)>, prune_after: usize, telemetry: bool) {
         self.inner.gamma = gamma;
         self.inner.prune_after = prune_after;
+        if telemetry {
+            self.inner.stats = Some(MicroStats::default());
+        }
         self.inner.leaf_override.clear();
         for (k, v) in override_ {
             self.inner.leaf_override.insert(k, v);
@@ -1338,6 +1383,19 @@ impl MicroTree {
         for _ in 0..iters {
             self.inner.iterate();
         }
+    }
+
+    /// Diagnostic counters from the last solve (telemetry=true): [d1,d2,d3,d4]
+    /// visits, leaf evals, and ns in action-gen / leaf-eval / regret.
+    fn stats(&self) -> (Vec<u64>, u64, u64, u64, u64) {
+        let s = self.inner.stats.as_ref().cloned().unwrap_or_default();
+        (
+            vec![s.depth_visits[1], s.depth_visits[2], s.depth_visits[3], s.depth_visits[4]],
+            s.n_leaves,
+            s.ns_action_gen,
+            s.ns_leaf_eval,
+            s.ns_regret,
+        )
     }
 
     fn strategy(&self) -> (Vec<Vec<i32>>, Vec<f64>, f64) {
