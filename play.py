@@ -28,6 +28,7 @@ from dataclasses import replace
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from cote_megaverse.agent import Planner
+from cote_megaverse.cfr_bot import CFRBot
 from cote_megaverse.interactive import (PlayerQuit, human_allocation,
                                         show_outcome, show_resolution,
                                         show_state)
@@ -36,8 +37,21 @@ from cote_megaverse.rules import (Allocation, GameState, MAX_ACTIONS,
                                   base_budget, exchange_damage, initial,
                                   multiplier)
 
+import _cote_cfr
+
 _BASE = os.path.dirname(os.path.abspath(__file__))
 RUN = "default"
+
+_TABLE_LOADED = False
+
+
+def _ensure_table():
+    """Load the 1v1 phase-4 table once (CFR bot needs it)."""
+    global _TABLE_LOADED
+    if not _TABLE_LOADED:
+        _cote_cfr.load_1v1_table(
+            os.path.join(_BASE, "cote_cfr", "1v1_table.csv"))
+        _TABLE_LOADED = True
 
 
 def _set_run(name):
@@ -246,7 +260,8 @@ def print_json(obj):
 
 
 def make_game(seed, depth, temp, game_index=None, force_ai_first=None,
-              force_human_first=None):
+              force_human_first=None, bot_type="planner", cfr_iters=120,
+              cfr_prune_after=20):
     rng = random.Random(seed)
     types = list(Type)
     state = initial(tuple(rng.choice(types) for _ in range(3)),
@@ -262,10 +277,17 @@ def make_game(seed, depth, temp, game_index=None, force_ai_first=None,
     if ai_starts:
         state = replace(state, player_to_move=False).prepare()
     bot_rng = random.Random(seed * 1000003 + 17)
-    planner = Planner(depth=depth, temperature=temp, rng=bot_rng)
-    return {"state": state, "planner": planner, "seed": seed,
+    if bot_type == "cfr":
+        _ensure_table()
+        bot = CFRBot(depth=3, iters=cfr_iters, cap=8, gamma=0.995,
+                     prune_after=cfr_prune_after, temperature=temp,
+                     rng=bot_rng, compress=True)
+    else:
+        bot = Planner(depth=depth, temperature=temp, rng=bot_rng)
+    return {"state": state, "planner": bot, "seed": seed,
             "ai_starts": ai_starts, "log": [], "history": [],
-            "sBot": 0, "compact": False, "game_index": game_index}
+            "sBot": 0, "compact": False, "game_index": game_index,
+            "bot_type": bot_type}
 
 
 def record_result(game, winner):
@@ -321,7 +343,8 @@ def _finish_game_if_needed(game):
             os.remove(_state_path())
         return
     nxt = make_game(sess["start_seed"] + done, sess["depth"], sess["temp"],
-                    game_index=done + 1)
+                    game_index=done + 1, bot_type=sess.get("bot_type", "planner"),
+                    cfr_iters=sess.get("cfr_iters", 120))
     nxt["session"] = sess
     save(nxt)
     print(f"\nGAME {done+1}/{total} (seed {nxt['seed']}) — "
@@ -332,7 +355,8 @@ def _finish_game_if_needed(game):
 def cmd_new(args):
     game = make_game(int(args.seed) if args.seed else 0, args.depth, args.temp,
                      force_ai_first=args.ai_first,
-                     force_human_first=args.human_first)
+                     force_human_first=args.human_first, bot_type=args.bot,
+                     cfr_iters=args.cfr_iters)
     game["compact"] = args.compact
     if args.compact:
         # Same rationale as in cmd_move: never hand back a state the player
@@ -391,14 +415,16 @@ def _play_one_game(game):
     return winner
 
 
-def run_session(total, start_seed, depth, temp):
+def run_session(total, start_seed, depth, temp, bot_type="planner", cfr_iters=120):
     """Run `total` interactive games back to back; record each result."""
     print(f"SESSION: {total} games | random first mover | temp={temp} "
-          f"depth={depth} | enter a / s / b / sw per action; q quits")
+          f"depth={depth} bot={bot_type} | enter a / s / b / sw per action; q quits")
     for game_index in range(1, total + 1):
         game = make_game(start_seed + game_index - 1, depth, temp,
-                         game_index=game_index)
-        game["session"] = {"total": total}
+                         game_index=game_index, bot_type=bot_type,
+                         cfr_iters=cfr_iters)
+        game["session"] = {"total": total, "bot_type": bot_type,
+                           "cfr_iters": cfr_iters}
         winner = _play_one_game(game)
         record_result(game, winner)
         print(f"\n=== GAME {game_index}/{total} finished: {winner} "
@@ -409,7 +435,8 @@ def run_session(total, start_seed, depth, temp):
 
 def cmd_session(args):
     try:
-        run_session(args.games, args.seed or 0, args.depth, args.temp)
+        run_session(args.games, args.seed or 0, args.depth, args.temp,
+                    args.bot, args.cfr_iters)
     except PlayerQuit:
         pass
 
@@ -589,6 +616,9 @@ def main():
                     help="human moves first (overrides the random coin flip)")
     pn.add_argument("--depth", type=int, default=2)
     pn.add_argument("--temp", type=float, default=0.12)
+    pn.add_argument("--bot", choices=["planner", "cfr"], default="planner",
+                    help="bot engine: planner (alpha-beta) or cfr (solver)")
+    pn.add_argument("--cfr-iters", type=int, default=120)
     pn.add_argument("--compact", action="store_true",
                     help="compact JSON output (LLM-friendly, one line per turn)")
     ps = sub.add_parser("session")
@@ -597,6 +627,8 @@ def main():
     ps.add_argument("--seed", type=int, default=0)
     ps.add_argument("--depth", type=int, default=2)
     ps.add_argument("--temp", type=float, default=0.12)
+    ps.add_argument("--bot", choices=["planner", "cfr"], default="planner")
+    ps.add_argument("--cfr-iters", type=int, default=120)
     pm = sub.add_parser("move"); pm.add_argument("--run", default="default")
     pm.add_argument("move")
     pv = sub.add_parser("view"); pv.add_argument("--run", default="default")
