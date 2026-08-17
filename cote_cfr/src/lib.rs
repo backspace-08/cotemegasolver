@@ -375,6 +375,7 @@ impl Trunk {
 // crosses the PyO3 boundary.
 
 use std::collections::HashMap;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
@@ -527,6 +528,22 @@ struct MicroSolver {
     iter_count: usize,
     // Diagnostic telemetry (enabled via `--telemetry`/stats flag; off by default).
     stats: Option<MicroStats>,
+    // Persistent session memoization for the 3v3 Chain DP leaf oracle. Keyed by
+    // a packed roster hash; kept across leaves of the same tree (not cleared
+    // per-leaf), cleared once per solve. RefCell keeps leaf_value(&self).
+    chain_cache: RefCell<HashMap<u64, f32>>,
+    chain_rho: f64,
+    // One-time ChainLeaf values per leaf node index, filled at build() end so
+    // the (expensive) duel-chain DP runs ONCE per unique leaf instead of once
+    // per iteration. 3v3 leaf_value reads this if present.
+    chain_leaf_vals: Vec<Option<f32>>,
+    // Zero-alloc signature storage: a single flat buffer holding all current
+    // regret-matching strategies, and the start offset of each info set within
+    // it. Filled in-place each iteration via disjoint field borrows - no per-
+    // iteration heap allocation.
+    sig_buf: Vec<f64>,
+    info_offsets: Vec<usize>,
+    sig_len: usize,
 }
 
 /// Per-resolution diagnostic counters (exposed to Python for profiling).
@@ -574,6 +591,12 @@ impl MicroSolver {
             prune_after: 0,
             iter_count: 0,
             stats: None,
+            chain_cache: RefCell::new(HashMap::new()),
+            chain_rho: 0.7,
+            chain_leaf_vals: Vec::new(),
+            sig_buf: Vec::new(),
+            info_offsets: Vec::new(),
+            sig_len: 0,
         };
         s.build();
         s
@@ -687,9 +710,36 @@ impl MicroSolver {
             self.infos[iid].regret = vec![0.0; na];
             self.infos[iid].avg = vec![0.0; na];
         }
+        // flat signature buffer + per-info offsets (allocated once)
+        let mut offs = Vec::with_capacity(self.infos.len());
+        let mut total = 0usize;
+        for info in &self.infos {
+            offs.push(total);
+            total += info.n_acts;
+        }
+        self.info_offsets = offs;
+        self.sig_buf = vec![0.0; total];
+        self.sig_len = total;
         self.r_a = vec![0.0; n];
         self.r_b = vec![0.0; n];
         self.v = vec![0.0; n];
+        // One-time pre-evaluation of multi-fighter leaf values (Chain DP). This
+        // runs ONCE per leaf node at build time (with the persistent per-solve
+        // memo), so leaf_value() during CFR iterations only does a Vec-index
+        // read instead of recomputing the duel chain 40x. 1v1 leaves are NOT
+        // pre-evaluated - they use the exact table lookup directly.
+        self.chain_leaf_vals = vec![None; n];
+        self.chain_cache.borrow_mut().clear();
+        for i in 0..n {
+            if self.terminals[i].is_some() || self.depths[i] < self.depth {
+                continue;
+            }
+            let s = &self.states[i];
+            if s.order_a.len() > 1 || s.order_b.len() > 1 {
+                let v = self.chain_leaf_value(s);
+                self.chain_leaf_vals[i] = Some(v as f32);
+            }
+        }
         let n_infos = self.infos.len();
         let max_acts = self.infos.iter().map(|x| x.n_acts).max().unwrap_or(1);
         self.reach_opp_sum = vec![0.0; n_infos];
@@ -718,6 +768,14 @@ impl MicroSolver {
                     }
                 }
             }
+        }
+        // 3v3 / multi-fighter leaves: pre-evaluated Bench-Aware Chain DP value
+        // (computed once at build, stored in chain_leaf_vals). Read is O(1).
+        if s.order_a.len() > 1 || s.order_b.len() > 1 {
+            if let Some(v) = self.chain_leaf_vals[i] {
+                return v as f64;
+            }
+            return self.chain_leaf_value(s);
         }
         // Learned (belief-conditioned) value injected from Python: exact-HP
         // 2v2/3v3 leaves are evaluated by the value network, keyed by the
@@ -755,6 +813,122 @@ impl MicroSolver {
         let r = if mv == 0 { s.sh_b + s.bank_b } else { s.sh_a + s.bank_a };
         let t = if s.turn >= 7 { 7 } else { s.turn };
         Some((ha.max(1), hb.max(1), mv, bank, sh, r, t))
+    }
+
+    /// 3v3 Chain DP leaf oracle (ported from Python `ChainLeaf`, validated on
+    /// 2v2 gold with |err|<=0.022). Recursively chains 1v1 duels through LIFO
+    /// promotion: value = E[ pA * W(A', B\B_act) + (1-pA) * W(A\A_act, B') ],
+    /// where pA comes from the phase-4 1v1 table for the active matchup, and
+    /// the residual HP of the duel winner feeds the next matchup. Memoized in
+    /// `chain_cache` (not cleared between leaves), cleared once per solve.
+    fn chain_leaf_value(&self, s: &State) -> f64 {
+        // roster: active-first, rest LIFO bench order; (order_id, hp_units)
+        let roster_a: Vec<(u8, i32)> = s
+            .order_a
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (c, s.hp_a[i]))
+            .collect();
+        let roster_b: Vec<(u8, i32)> = s
+            .order_b
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (c, s.hp_b[i]))
+            .collect();
+        self.chain_rec(&roster_a, &roster_b, s.to_move, s.bank_a, s.bank_b,
+                       s.sh_a, s.sh_b, 0)
+    }
+
+    fn chain_hash(ra: &[(u8, i32)], rb: &[(u8, i32)], mv: i32, ba: i32, bb: i32,
+                  sha: i32, shb: i32) -> u64 {
+        // FNV-1a over the packed state. Types and HP are all that matter for the
+        // duel outcome given the engine's fixed ATK/type tables.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &(c, hp) in ra {
+            h = (h ^ (c as u64)).wrapping_mul(0x100000001b3);
+            h = (h ^ (hp as u64)).wrapping_mul(0x100000001b3);
+        }
+        h = (h ^ 0xff).wrapping_mul(0x100000001b3);
+        for &(c, hp) in rb {
+            h = (h ^ (c as u64)).wrapping_mul(0x100000001b3);
+            h = (h ^ (hp as u64)).wrapping_mul(0x100000001b3);
+        }
+        h = (h ^ (mv as u64)).wrapping_mul(0x100000001b3);
+        h = (h ^ (ba as u64)).wrapping_mul(0x100000001b3);
+        h = (h ^ (bb as u64)).wrapping_mul(0x100000001b3);
+        h = (h ^ (sha as u64)).wrapping_mul(0x100000001b3);
+        h = (h ^ (shb as u64)).wrapping_mul(0x100000001b3);
+        h
+    }
+
+    fn chain_rec(&self, ra: &[(u8, i32)], rb: &[(u8, i32)], mv: i32, ba: i32,
+                 bb: i32, sha: i32, shb: i32, depth: i32) -> f64 {
+        if ra.is_empty() {
+            return -1.0;
+        }
+        if rb.is_empty() {
+            return 1.0;
+        }
+        if depth > 12 {
+            return 0.0;
+        }
+        let key = Self::chain_hash(ra, rb, mv, ba, bb, sha, shb);
+        if let Some(&v) = self.chain_cache.borrow().get(&key) {
+            return v as f64;
+        }
+        let (ta, hpa) = ra[0];
+        let (tb, hpb) = rb[0];
+        // hits for A's active vs B's active
+        let ha = self.trunk.hits_to_kill(0, ta, 1, tb, hpa);
+        let hb = self.trunk.hits_to_kill(1, tb, 0, ta, hpb);
+        // 1v1 value for the active duel from the loaded belief table
+        let pA = if ha <= 0 || hb <= 0 {
+            0.5
+        } else {
+            let bank = if mv == 0 { ba } else { bb };
+            let sh = if mv == 0 { sha } else { shb };
+            let r = if mv == 0 { shb + bb } else { sha + ba };
+            let key1 = (ha.min(16), hb.min(16), mv, bank, sh, r, 7); // phase-4
+            let v = v1_table().lock().ok().and_then(|g| g.get(&key1).copied());
+            match v {
+                Some(vv) => (vv + 1.0) / 2.0,
+                None => 0.5,
+            }
+        };
+        let pA = pA.clamp(0.0, 1.0);
+        // Residual HP of the duel winner (damage-exchange model, rho). Discrete
+        // integer arithmetic, no float drift: the winner takes
+        // `round(rho * loser_hp)` damage (>=1), survivor HP = winner - that.
+        let damage_taken = |loser_hp: i32| -> i32 {
+            ((self.chain_rho * loser_hp as f64).round() as i32).max(1)
+        };
+        let val = if pA <= 0.0 {
+            // A's active loses the duel; A's next bench promotes, B survives
+            let hb_new = (hpb.saturating_sub(damage_taken(hpa))).max(1);
+            let mut rb2 = rb.to_vec();
+            rb2[0] = (tb, hb_new);
+            self.chain_rec(&ra[1..], &rb2, 0, ba, bb, 0, 0, depth + 1)
+        } else if pA >= 1.0 {
+            // A's active wins; B's active is dead, B's bench promotes
+            let ha_new = (hpa.saturating_sub(damage_taken(hpb))).max(1);
+            let mut ra2 = ra.to_vec();
+            ra2[0] = (ta, ha_new);
+            self.chain_rec(&ra2, &rb[1..], 1, ba, bb, 0, 0, depth + 1)
+        } else {
+            let ha_new = (hpa.saturating_sub(damage_taken(hpb))).max(1);
+            let hb_new = (hpb.saturating_sub(damage_taken(hpa))).max(1);
+            let mut ra2 = ra.to_vec();
+            ra2[0] = (ta, ha_new);
+            let mut rb2 = rb.to_vec();
+            rb2[0] = (tb, hb_new);
+            let a_wins = pA * self.chain_rec(&ra2, &rb[1..], 1, ba, bb, 0, 0,
+                                             depth + 1);
+            let b_wins = (1.0 - pA)
+                * self.chain_rec(&ra[1..], &rb2, 0, ba, bb, 0, 0, depth + 1);
+            a_wins + b_wins
+        };
+        self.chain_cache.borrow_mut().insert(key, val as f32);
+        val
     }
 
     /// Dense-grid 1v1 value (table-builder leaf path), turn-invariant.
@@ -802,7 +976,34 @@ impl MicroSolver {
 
     fn iterate(&mut self) {
         let n = self.states.len();
-        let sigs = self.sigs();
+        // Zero-alloc strategy computation via disjoint field borrows: infos
+        // (immutable) and sig_buf (mutable) are different fields of self, so
+        // Rust allows this in one call without capturing &mut self.
+        {
+            let infos = &self.infos;
+            let offs = &self.info_offsets;
+            let buf = &mut self.sig_buf;
+            for (iid, info) in infos.iter().enumerate() {
+                let start = offs[iid];
+                let mut sum = 0.0;
+                for (a, &r) in info.regret.iter().enumerate() {
+                    let pos = r.max(0.0);
+                    buf[start + a] = pos;
+                    sum += pos;
+                }
+                let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 / info.n_acts as f64 };
+                for a in 0..info.n_acts {
+                    // BUGFIX: on the all-zero-regret path buf[start+a] holds pos=0
+                    // (from the first loop), so *= inv would stay 0. Recompute the
+                    // normalized value explicitly: pos/sum, or 1/n_acts when uniform.
+                    buf[start + a] = if sum > 0.0 {
+                        buf[start + a] * inv
+                    } else {
+                        inv
+                    };
+                }
+            }
+        }
         self.iter_count += 1;
         let do_prune = self.prune_after > 0 && self.iter_count > self.prune_after;
         if do_prune {
@@ -838,7 +1039,7 @@ impl MicroSolver {
                 continue;
             }
             let iid = self.info_id[i];
-            let sig = &sigs[iid];
+            let base = self.info_offsets[iid];
             let m = if do_prune { Some(&self.mask[iid]) } else { None };
             for (a, &ci) in self.children[i].iter().enumerate() {
                 if let Some(mm) = m {
@@ -846,7 +1047,7 @@ impl MicroSolver {
                         continue;
                     }
                 }
-                let p = sig[a];
+                let p = self.sig_buf[base + a];
                 if self.states[i].to_move == 0 {
                     self.r_a[ci] += self.r_a[i] * p;
                     self.r_b[ci] += self.r_b[i];
@@ -870,7 +1071,7 @@ impl MicroSolver {
                 self.v[i] = v;
             } else {
                 let iid = self.info_id[i];
-                let sig = &sigs[iid];
+                let base = self.info_offsets[iid];
                 let m = if do_prune { Some(&self.mask[iid]) } else { None };
                 let mut acc = 0.0;
                 for (a, &ci) in self.children[i].iter().enumerate() {
@@ -879,7 +1080,7 @@ impl MicroSolver {
                             continue;
                         }
                     }
-                    acc += sig[a] * self.v[ci];
+                    acc += self.sig_buf[base + a] * self.v[ci];
                 }
                 self.v[i] = self.gamma * acc;
             }
@@ -915,10 +1116,11 @@ impl MicroSolver {
         for iid in 0..self.infos.len() {
             let na = self.infos[iid].n_acts;
             let rsum = self.reach_opp_sum[iid];
+            let base = self.info_offsets[iid];
             let mut v_info = 0.0;
             for a in 0..na {
                 let cfv = if rsum > 0.0 { self.cfv_contrib[iid][a] / rsum } else { 0.0 };
-                v_info += sigs[iid][a] * cfv;
+                v_info += self.sig_buf[base + a] * cfv;
             }
             // sign: A maximizes (+), B minimizes (-)
             let a_move = self.a_move_of_info(iid);
@@ -928,7 +1130,7 @@ impl MicroSolver {
                 let delta = rsum * sign * (cfv - v_info);
                 let r = self.infos[iid].regret[a] + delta;
                 self.infos[iid].regret[a] = r.max(0.0);
-                self.infos[iid].avg[a] += self.reach_self_sum[iid] * sigs[iid][a];
+                self.infos[iid].avg[a] += self.reach_self_sum[iid] * self.sig_buf[base + a];
             }
         }
         if let Some(st) = self.stats.as_mut() {
@@ -1373,6 +1575,7 @@ impl MicroTree {
     fn solve(&mut self, iters: usize, gamma: f64, override_: Vec<(Vec<i32>, f64)>, prune_after: usize, telemetry: bool) {
         self.inner.gamma = gamma;
         self.inner.prune_after = prune_after;
+        self.inner.chain_cache.borrow_mut().clear(); // fresh session memo per solve
         if telemetry {
             self.inner.stats = Some(MicroStats::default());
         }
