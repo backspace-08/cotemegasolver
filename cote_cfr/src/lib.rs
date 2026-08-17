@@ -533,6 +533,9 @@ struct MicroSolver {
     // per-leaf), cleared once per solve. RefCell keeps leaf_value(&self).
     chain_cache: RefCell<HashMap<u64, f32>>,
     chain_rho: f64,
+    // Physical damage exchange: use per_hit_loser/per_hit_winner ratio instead
+    // of the fixed chain_rho, for the winner's residual HP (validator switch).
+    physical_exchange: bool,
     // One-time ChainLeaf values per leaf node index, filled at build() end so
     // the (expensive) duel-chain DP runs ONCE per unique leaf instead of once
     // per iteration. 3v3 leaf_value reads this if present.
@@ -593,6 +596,7 @@ impl MicroSolver {
             stats: None,
             chain_cache: RefCell::new(HashMap::new()),
             chain_rho: 0.7,
+            physical_exchange: true,
             chain_leaf_vals: Vec::new(),
             sig_buf: Vec::new(),
             info_offsets: Vec::new(),
@@ -896,11 +900,22 @@ impl MicroSolver {
             }
         };
         let pA = pA.clamp(0.0, 1.0);
-        // Residual HP of the duel winner (damage-exchange model, rho). Discrete
-        // integer arithmetic, no float drift: the winner takes
-        // `round(rho * loser_hp)` damage (>=1), survivor HP = winner - that.
+        // Residual HP of the duel winner. Two models (validator switch):
+        //  - fixed rho:  round(rho * loser_hp), rho = 0.7
+        //  - physical:   loser lands (loser_hp / per_hit_winner) hits, each
+        //                dealing per_hit_loser -> damage_taken = round(loser_hp *
+        //                per_hit_loser / per_hit_winner). Discrete, no drift.
+        let per_hit_w = self.trunk.per_hit_units(if mv == 0 { 0 } else { 1 }, if mv == 0 { ta } else { tb },
+                                                 if mv == 0 { 1 } else { 0 }, if mv == 0 { tb } else { ta });
+        let per_hit_l = self.trunk.per_hit_units(if mv == 0 { 1 } else { 0 }, if mv == 0 { tb } else { ta },
+                                                 if mv == 0 { 0 } else { 1 }, if mv == 0 { ta } else { tb });
         let damage_taken = |loser_hp: i32| -> i32 {
-            ((self.chain_rho * loser_hp as f64).round() as i32).max(1)
+            if self.physical_exchange && per_hit_w > 0 {
+                let rate = per_hit_l as f64 / per_hit_w as f64;
+                ((loser_hp as f64 * rate).round() as i32).max(1)
+            } else {
+                ((self.chain_rho * loser_hp as f64).round() as i32).max(1)
+            }
         };
         let val = if pA <= 0.0 {
             // A's active loses the duel; A's next bench promotes, B survives
@@ -1615,6 +1630,23 @@ impl MicroTree {
     /// strategy - the belief prior for Continual Subgame Resolving.
     fn opponent_reach(&self) -> HashMap<(i32, i32), f64> {
         self.inner.opponent_reach()
+    }
+
+    /// Debug/validation: evaluate the Chain DP leaf oracle on a raw flat state
+    /// (units-of-10 HP). Exposed to validate ChainLeaf against the 2v2 gold.
+    fn chain_value(&self, state: Vec<i32>) -> f64 {
+        match decode_state(&state) {
+            Ok(s) => self.inner.chain_leaf_value(&s),
+            Err(_) => 0.0,
+        }
+    }
+
+    /// Toggle the physical damage-exchange model for ChainLeaf residual HP
+    /// (validator: compare vs fixed rho on 2v2 gold).
+    #[pyo3(signature = (on=false))]
+    fn set_physical_exchange(&mut self, on: bool) {
+        self.inner.physical_exchange = on;
+        self.inner.chain_cache.borrow_mut().clear();
     }
 }
 
