@@ -63,9 +63,12 @@ formula. The 1v1 table is built at atk=2000/mult=1.0, where
   strategic layers (punish banking, burst setup, survival). Benchmark.
 - `agent_v2.py` — **Planner (v2)**, frozen variant; used in `botvbot.py` to
   compare generations.
-- `cfr_bot.py` — **CFR bot**: re-solves a subtree through the Rust engine
-  (`_cote_cfr.MicroTree` / `solve_micro_belief`); duel leaves come from the
-  1v1 table, 2v2/3v3 leaves are material (or the value-net if provided).
+- `cfr_bot.py` — **CFR bot**: Continual Subgame Resolving through the Rust
+  engine (`_cote_cfr.MicroTree`). 1v1 leaves come from the phase-4 table;
+  2v2/3v3 leaves are evaluated **natively in Rust** by `chain_leaf_value`
+  (the ChainLeaf oracle) or by a Python value-net if provided. Root belief is
+  the previous resolve's opponent reach, hard-filtered by public facts and
+  blended with the soft observation memory.
 
 ## 6. Solvers
 
@@ -83,14 +86,24 @@ The old full-history 1v1 solver (`solver_tree_fh.py`) and its harnesses were
 `cote_cfr/src/lib.rs` (PyO3, `import _cote_cfr`):
 
 - `MicroTree` / `solve_micro` / `solve_micro_belief` — depth-limited CFR,
-  micro-trees, belief roots, leaves.
+  micro-trees, belief roots, leaves. `MicroTree` takes a `compress` flag
+  (action-grid compression for 3v3, E≥6) and a `telemetry` flag.
+- `chain_leaf_value` / `chain_rec` — **native Rust ChainLeaf** (3v3 leaf
+  oracle): duel-chain DP through LIFO promotion, residual HP via the physical
+  damage-exchange ratio, memoized per solve. One-time leaf pre-eval in `build`.
+- `opponent_reach` — the opponent's average-strategy reach over their next
+  split (the continual-resolving root belief).
 - `solve_1v1_step` — batched backward-induction step for building the 1v1
   table (sliced, multiprocessing driver `server/build_1v1_table.py`).
-- `load_1v1_table` — loads the belief table.
+- `load_1v1_table` — loads the phase-4 belief table.
 - `MicroSolver::root_strategy` returns probabilities from the **average**
   profile and the value from `avg_profile_value()` (a backward pass under the
   average strategy), NOT from the current regret-matching iteration. This was
   the bug that made `solve_1v1_step` write oscillating values.
+- `sigs_inplace` intent is served by a flat zero-alloc `sig_buf` +
+  `info_offsets` (disjoint-field borrowing; no per-iteration heap allocs).
+  Fixed a subtle bug where the uniform signature path (`0 * norm`) stayed 0,
+  which silently zeroed reach/avg.
 
 Release profile (`cote_cfr/Cargo.toml`):
 ```toml
@@ -110,24 +123,31 @@ previous build, kept locally (gitignored) for comparison.
 
 ## 8. Server scripts — `server/`
 
-- `build_1v1_table.py` — monolithic 1v1 table build (phase 4 + ramp,
-  γ=1.0, truncated horizon; checkpoints, resume, multiprocessing).
+- `build_1v1_table.py` — **phase-4-only** table build (`V = T(V)`, γ=0.995,
+  truncated horizon; checkpoints, resume, multiprocessing). Ramp turns 1..6
+  are behind `--ramp` (reference only); the bot resolves them at runtime.
 - `rebuild_1v1_table.sh` — one-shot, fully automated rebuild on a fresh
   server: system packages (apt), Rust (rustup), venv, engine build, then
-  backup → smoke (with an automatic convergence gate) → full → bench → compare.
-  Steps can be run individually (`--env | --backup | --smoke | --full |
-  --bench | --compare`).
+  backup → full → bench → compare. Steps can be run individually
+  (`--env | --backup | --full | --bench | --compare`). `--env` rebuilds the
+  Rust wheel (delete `.venv/.cote_cfr_rustflags` to force).
 - `gen_value_data.py`, `train_value_net.py`, `value_leaf.py` — ReBeL: data
   generation, value-net training, network leaf value.
 
 ## 9. Harnesses and benchmarks
 
-- `play.py` — headless "human/LLM vs Planner" interface: `new/move/view/end/session`,
-  `--compact` for LLM. Honest observation (hidden info is never shown).
+- `play.py` — headless "human/LLM vs bot" interface: `new/move/view/end/session`,
+  `--compact` for LLM, `--bot cfr|planner` (CFR solver default now integrated).
+  Honest observation (hidden info is never shown).
 - `interactive.py` — terminal UI (legacy interactive flow).
-- `cfr_vs_planner.py` — CFR bot vs Planner (3v3, 3v3 leaves).
-- `test_1v1_duel_bot.py` — fast pure-1v1 duel benchmark, bot vs Planner
-  (both seats, multiprocessing).
+- `cfr_vs_planner.py` — CFR bot vs Planner (3v3, duplicate matching, reports
+  winrate/ΔScore/half-turns/latency).
+- `test_1v1_duel_bot.py` — pure-1v1 duel benchmark, duplicate matching, even
+  profiles E/F/G/I, both seats, multiprocessing.
+- `server/analyze_state.py` — construct an arbitrary board by hand and step
+  the CFR bot, dumping belief/root-strategy/value per turn.
+- `server/gold_2v2.py` — exact 2v2 minimax (ground truth for ChainLeaf).
+- `server/validate_chain.py` — validate the Rust ChainLeaf vs 2v2 gold.
 - `botvbot.py` — bot vs bot (agent v3 vs v2).
 - `bot_selfplay.py` — Planner vs itself.
 
@@ -141,14 +161,7 @@ previous build, kept locally (gitignored) for comparison.
 - `table_out/` — trained value-nets (`vnet1/2/3.npz` + `.pt`).
 - `runs/` — `play.py` sessions (gitignored).
 
-## 12. opencode config — `.opencode/agent/`
-
-Universal free subagents (`deepseek-v4-flash-free`, `big-pickle`,
-`hy3-free`, `laguna-s-2.1-free`, `mimo-v2.5-free`, `nemotron-3-ultra-free`,
-`nemotron-3.5-lightning-free`) — for autonomous subtasks (search, summary,
-checks). Name = model on the `opencode` provider.
-
-## 13. How it all fits together
+## 12. How it all fits together
 
 ```
 rules.py ── rules reference (game, harnesses, belief)
@@ -164,61 +177,123 @@ Benchmark flow: the harness runs `rules.py`; each turn the bot re-solves a
 subtree (`_cote_cfr`) with the belief (`infoset.py`) and table leaves; the
 Planner uses heuristics. Win/loss is judged by `rules.py`.
 
-## 14. Current state and open questions
+## 13. Current state and open questions
 
-- **Avg-profile value fix is in and verified.** `solve_1v1_step` now writes
-  stable, converged values (verified: recomputed cells match the table within
-  spread < 0.003 across 100–1600 iterations). Rebuilds are reproducible.
-- **1v1 table rebuilt on the server** (converged at phase-4 iter 14,
-  delta < 0.02), with the Rust tuning above. Old table kept as
-  `cote_cfr/1v1_table_old.csv`.
+### Architecture: Continual Subgame Resolving (CSR)
 
-### Open problem: the new table is not behaving correctly in the benchmark
+The solver moved from a monolithic 7-turn table to **Continual Subgame
+Resolving** (DeepStack/Burch reach style):
 
-CFR bot vs Planner, pure 1v1 duels (`test_1v1_duel_bot.py`, same seeds as the
-old runs):
+- **Offline:** only the **stationary phase-4 table** (turn ≥ 7, `V = T(V)`)
+  is built — `cote_cfr/1v1_table.csv` (belief key
+  `hA,hB,to_move,own_bank,own_sh,R`, turn clamped to 7). Built on the server
+  via `server/build_1v1_table.py` (multiprocessing, checkpoints, resume),
+  converged at phase-4 iter ~20, γ=0.995, solve_iters=100/150, tol=0.02.
+- **Runtime:** turns 1..6 are re-solved on the fly at `depth = 7 − turn`;
+  turn ≥ 7 re-solves at `depth = 3` (3v3) / `self.depth` (1v1), leaves = the
+  phase-4 table. No intermediate turn grids are precomputed.
 
-| table | aggregate CFR winrate | CFR-first | CFR-second | draws |
-|---|---|---|---|---|
-| old | 35% | 56% | 14% | 0% |
-| new | 22% | 30% | 14% | **13%** |
+### 1v1 benchmark (`test_1v1_duel_bot.py`, duplicate matching, even profiles)
 
-Draws are new and suspicious: in RULES.md a draw only happens if both sides
-refuse to attack (turtling), which signals suboptimal/buggy play. A traced
-draw game shows **both bots playing `d=4` shields every turn, never attacking**
-for 61 half-turns.
+Fair near-even start positions found in the table (`|V| < 0.05`):
 
-Root-cause investigation so far (all verified by direct micro-tree solves):
+| Profile | Position | CFR winrate (vs Planner) | ΔScore |
+|---|---|---|---|
+| E | (13,16) @t7 | ~75% | +1.10 |
+| F | (11,14) @t7 | ~64% | +0.56 |
+| G | (12,15) @t7 | ~74% | +1.06 |
+| I | (13,15) @t1 | ~51% | +0.04 |
 
-- The micro-tree value on turn 1 **oscillates with search depth** for a fresh
-  (3,3) duel: depth2=+0.403, depth3=+0.084, depth4=+0.267, depth6=+0.220,
-  while the table says turn1=+0.403 (matches only depth 2). The bot uses
-  depth=3 and therefore sees 0.084 and decides to bank/shield instead of
-  attacking.
-- At phase-4 turn 7 the micro-tree converges to the table value (0.997 ≈
-  0.990), so phase 4 is a genuine fixed point.
-- The table's turn 1..6 are built as a **cascade** `turn k ← turn k+2`
-  (one backward-induction pass each), unlike phase 4 which iterates to
-  convergence. Hypothesis (not yet fully proven): this cascade is the defect —
-  deep micro-tree values on turn 1 disagree with the table, and draws/weak
-  play follow.
+Key findings:
+- **Phase-4 (turn ≥ 7) is the solver's strong side** — 64–75% on even
+  positions. The exact table dominates the heuristic Planner in the endgame.
+- **Early game (turn 1–6) is a ~51% parity** — the opening is simple (small
+  budgets), the shallow resolve gains little over the heuristic.
+- **Symmetric 16v16 is a pure first-mover win** in the model (`fresh(16,16)
+  = +0.92`); even positions must give the later mover a 2–3 hit handicap.
+- Hidden-split starts (e.g. opponent holding R=3) are NOT fair as benchmarks:
+  a concrete split is tempo-biased vs the table's split-average.
 
-Next steps (for a new session):
-1. Verify the ramp-cascade hypothesis with a clean experiment: for turn k,
-   compare the table value against a **deep** micro-tree solve with a cap that
-   keeps the leaves inside the table (the earlier check used cap=4 which
-   truncated leaves — invalid; redo with a cap that does not clip).
-2. If confirmed, fix `build_1v1_table.py` to iterate each ramp turn to
-   convergence (like phase 4) instead of a single cascade pass; re-smoke,
-   re-bench.
-3. Re-run `server/rebuild_1v1_table.sh --all` on the server and compare
-   benchmark winrate and draw rate vs the acceptance criterion (>50%, no
-   suspicious draws).
+### 3v3 benchmark (`cfr_vs_planner.py`, duplicate matching)
+
+| Config | CFR winrate | ΔScore | avg lat |
+|---|---|---|---|
+| depth-3, iters=80 (old leaf) | ~48% | −0.06 | 831ms |
+| depth-3 + native ChainLeaf + physical exchange | **53.8%** (10k games) | +0.177 | 138ms |
+| depth-4 | 50% (not better, 55× slower) | +0.20 | 5568ms |
+
+- **ChainLeaf** (Bench-Aware Sequential Matchup Chain DP) is the 3v3 leaf
+  oracle, **ported to Rust** (`lib.rs::chain_leaf_value`/`chain_rec`): chains
+  1v1 duels through LIFO promotion, residual HP via a **physical damage
+  exchange ratio** (`per_hit_loser/per_hit_winner`, replacing the old magic
+  rho=0.7). Validated on the exact 2v2 minimax (MAE 0.019).
+- **Performance work:** zero-alloc flat `sig_buf` (fixed a uniform-signature
+  bug where `0*norm` stayed 0), one-time leaf pre-eval in `build`, action-grid
+  compression. Worst-case depth-4: 7.0s → 3.6s; real-match avg latency
+  **456ms → 73ms** (later 138ms at 10k scale).
+- **depth-4 does not pay off** at iters=80: the bigger tree does not converge,
+  so it plays no better than depth-3 and is far slower.
+
+### Belief / hidden-info model (`infoset.py`)
+
+- Max-entropy **uniform prior** over the `(shields, bank)` split (identical to
+  the table builder), as the base of a **soft observation memory**.
+- **Soft memory prior:** Laplace-smoothed evidence weights over `(shields,
+  bank)` accumulated from PUBLIC facts only — a resolved attack (proves the
+  shields they held) and a revealed budget (proves the bank they held, and the
+  joint `(shields, bank)` when the previous split resolves uniquely). The
+  prior TILTS toward the opponent's observed tendency (e.g. a turtler's
+  repeated 4 shields → `(4,0)` mass grows) but **never hard-zeroes any split**,
+  so no false certainty. Counts decay each observed turn (`decay=0.85`) so the
+  belief tracks the CURRENT tendency, not ancient history.
+- **Turn-local shield pin** (cleared every new opponent allocation, including
+  switches): a resolved attack hard-constrains the CURRENT split only — legal,
+  because the shields we met are the ones currently held. Cross-turn tendency
+  lives in the soft memory, not in a hard pin.
+- **Continual reach:** the opponent's average-strategy reach from the previous
+  resolve becomes the next root belief (DeepStack), hard-filtered by the same
+  public facts and **blended with the soft memory** (`reach × memory`,
+  normalized) so observed tendency reaches the solve root even when the reach
+  is present.
+
+### Known limitations / open questions
+
+1. **3v3 leaf blind spot — banked burst threat.** In 3v3, ChainLeaf evaluates
+   the active duel's `pA` from the 1v1 table but does NOT model that an
+   opponent holding a large team bank will burst `a8` next round. The 1v1 table
+   handles this exactly; the 3v3 leaf does not. (Note: the old hard bank pin
+   could force a false `(0,4)=1.0` certainty here; the soft memory caps that at
+   ~0.485 and the bot no longer blindly attacks into a shield wall.)
+2. **1v1/2v1 shield-deadlock draws (~11%).** When a game reduces to a 1v1/2v1
+   endgame against a turtler holding 4 shields every turn, the depth-3 resolve
+   sometimes deadlocks to the 80-half-turn cap instead of finding the
+   multi-burst kill. The soft memory makes the bot LEARN the turtler (belief
+   tilts to `(4,0)`), but in type-disadvantage matchups (e.g. bot at 0.7 mult
+   needing two bursts, which need >3 plies) the shallow resolve and the
+   best-responder opponent model still stall. Depth 4+ is not the answer
+   (measured: depth-4 draws more, depth-5 is ~6s/hit latency, depth-6 does not
+   terminate); more CFR iterations reduce draws slightly at 2x latency.
+3. **Switch timing.** The bot switches, but sometimes too late (lets a fighter
+   fall to ~1 HP before switching) — the fixed-LIFO chain leaf does not model
+   voluntary pre-death switching value.
+4. **Early game parity.** Turn 1–6 resolve is shallow (`7−turn`) and gains
+   little over the heuristic; improving it (e.g. a cheap ramp for turns 1–3)
+   is low-yield because the opening is simple.
+5. **Symmetric first-mover dominance.** In a symmetric 3v3 the first mover
+   has a large model advantage (second seat ~44% vs first ~64%).
+
+### Verified internals
+
+- `solve_1v1_step` writes stable converged values (avg-profile value, not the
+  current iteration).
+- 54 tests pass: `python -m unittest discover -s tests`.
 
 ### Other notes
 
-- γ: the table is built with γ=1.0 (truncated horizon); the bot re-solves with
-  γ=0.995 — a search parameter, not a rule.
-- Lab solver removed: `solver_tree_fh.py`, `match_1v1.py`, `run_full_history.py`,
+- γ: table built and bot re-solves with γ=0.995 — a search parameter, not a
+  rule.
+- The table is **phase-4 only**; the old cascade ramp (turn 1..6 in the CSV)
+  is dead weight and no longer read by the bot.
+- Lab solver files (`solver_tree_fh.py`, `match_1v1.py`, `run_full_history.py`,
   `run_table.py`, `export_1v1_table.py`, `test_1v1_solver_vs_planner.py`,
-  `server_out_fh/` are gone. The table CSV is the only 1v1 artifact.
+  `server_out_fh/`) are removed. The table CSV is the only 1v1 artifact.
