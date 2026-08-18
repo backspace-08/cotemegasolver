@@ -5,14 +5,18 @@ side's public budget, and public resolutions. I never see the bot's hidden bank
 or held shields — the harness enforces the Phase-0 boundary.
 
 Usage:
-  python play.py new --seed N [--ai_first|--human_first] [--temp T]
+  python play.py new --seed N [--ai_first|--human_first] [--temp T] [--bot cfr|planner]
   python play.py move "a,d,b" [sw]
   python play.py view
   python play.py end
-  python play.py session --games 20 [--seed S] [--temp T]
+  python play.py session --games 20 [--seed S] [--temp T] [--bot cfr|planner]
       Session mode: play N games in a row; after each game the result is
       recorded automatically (with timestamp) to session_log.json and
       winrate_log.json, then the next game starts immediately. You just play.
+      Default bot is the CFR solver (--bot cfr); use --bot planner for the
+      alpha-beta agent. Every finished game also gets a detailed per-turn log
+      at runs/<run>/game_logs/game_<seed>.json (moves, HP, actives, budget,
+      and for the CFR bot its belief/reach/value).
 """
 import argparse
 import datetime
@@ -114,6 +118,68 @@ def _read_json(path, default):
 
 def _write_json(path, data):
     with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=1)
+
+
+def _act_str(side):
+    c = side.characters[side.active]
+    return f"#{side.active}:{c.type.name}/{c.hp}/{c.atk}"
+
+
+def _log_move(game, tag, before, move, after):
+    """Append a detailed per-turn entry to game['dlog'] (types, HP, ATK,
+    actives, budget, and for the bot's turn its belief/reach/value)."""
+    if "dlog" not in game:
+        game["dlog"] = []
+    entry = {
+        "turn": before.turn, "tag": tag,
+        "a": move.attacks, "d": move.defends, "b": move.bonuses,
+        "sw": move.switch_to,
+        "budget": (before.player.actions if tag == "YOU"
+                   else before.opponent.actions),
+        "actYOU": _act_str(before.player), "actBOT": _act_str(before.opponent),
+        "hpYOU": [c.hp for c in after.player.characters],
+        "hpBOT": [c.hp for c in after.opponent.characters],
+    }
+    if tag == "BOT":
+        r = game["planner"].last_report
+        v = r.get("value")
+        if isinstance(v, (int, float)):
+            entry["value"] = round(float(v), 4)
+        bel = r.get("belief")
+        # CFR bot: belief is a list of (shields, bank, prob) triples. The
+        # Planner stores a {shields: prob} dict - skip it here (not a belief
+        # over hidden (sh,bank) pairs).
+        if (isinstance(bel, list) and bel
+                and all(isinstance(x, (list, tuple)) and len(x) == 3
+                        for x in bel)):
+            entry["belief"] = [[s, k, round(float(p), 3)]
+                               for s, k, p in bel]
+        reach = getattr(game["planner"], "_reach", None)
+        if reach:
+            entry["reach"] = [[s, k, round(float(p), 3)]
+                              for (s, k), p in reach.items()]
+    game["dlog"].append(entry)
+
+
+def _write_game_log(game):
+    """Write the detailed per-turn log of a finished game to
+    runs/<run>/game_logs/game_<seed>.json (structured, machine-readable)."""
+    dlog = game.get("dlog") or []
+    if not dlog:
+        return
+    out_dir = os.path.join(_BASE, "runs", RUN, "game_logs")
+    os.makedirs(out_dir, exist_ok=True)
+    data = {
+        "seed": game["seed"],
+        "first": "BOT" if game["ai_starts"] else "YOU",
+        "bot": game.get("bot_type"),
+        "result": _winner_of(game),
+        "rosters": game.get("start_roster") or [],
+        "turns": dlog,
+    }
+    with open(os.path.join(out_dir, f"game_{game['seed']}.json"), "w",
+              encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=1)
 
 
@@ -284,14 +350,25 @@ def make_game(seed, depth, temp, game_index=None, force_ai_first=None,
                      rng=bot_rng, compress=True)
     else:
         bot = Planner(depth=depth, temperature=temp, rng=bot_rng)
+
+    def _roster_str(tag, side):
+        parts = []
+        for i, c in enumerate(side.characters):
+            star = "*" if i == side.active else " "
+            parts.append(f"{star}{i}:{c.type.name}/{c.hp}/{c.atk}")
+        return f"TEAM {tag}: " + ", ".join(parts)
+
     return {"state": state, "planner": bot, "seed": seed,
             "ai_starts": ai_starts, "log": [], "history": [],
-            "sBot": 0, "compact": False, "game_index": game_index,
-            "bot_type": bot_type}
+            "dlog": [], "sBot": 0, "compact": False, "game_index": game_index,
+            "bot_type": bot_type,
+            "start_roster": [_roster_str("YOU", state.player),
+                             _roster_str("BOT", state.opponent)]}
 
 
 def record_result(game, winner):
     """Timestamped result -> session_log.json; w/l/d -> winrate_log.json."""
+    _write_game_log(game)
     entry = {
         "time": datetime.datetime.now().isoformat(timespec="seconds"),
         "game": game.get("game_index"),
@@ -366,7 +443,7 @@ def cmd_new(args):
         while not (state.player_to_move
                    or state.player.lost or state.opponent.lost):
             state = run_bot(state, game["planner"], verbose=False,
-                            history=game.get("history"))
+                            history=game.get("history"), game=game)
             game["state"] = state
     save(game)
     if args.compact:
@@ -391,6 +468,7 @@ def _play_one_game(game):
                 move = human_allocation(state, input_fn=input, output_fn=print)
                 before = state
                 state = apply(state, move)
+                _log_move(game, "YOU", before, move, state)
                 planner.observe(move.attacks, move.bonuses, move.switch,
                                 budget=before.player.actions,
                                 turn=before.turn)
@@ -405,6 +483,7 @@ def _play_one_game(game):
                 # same as run_bot does.
                 planner.observe_shields(before.player.shields)
                 state = apply(state, move)
+                _log_move(game, "BOT", before, move, state)
                 show_resolution(before, move, state, "AI")
             game["state"] = state
             game["log"].append(move.label)
@@ -416,7 +495,7 @@ def _play_one_game(game):
     return winner
 
 
-def run_session(total, start_seed, depth, temp, bot_type="planner", cfr_iters=120):
+def run_session(total, start_seed, depth, temp, bot_type="cfr", cfr_iters=120):
     """Run `total` interactive games back to back; record each result."""
     print(f"SESSION: {total} games | random first mover | temp={temp} "
           f"depth={depth} bot={bot_type} | enter a / s / b / sw per action; q quits")
@@ -451,7 +530,7 @@ def cmd_move(args):
         if state.player.lost or state.opponent.lost:
             break
         state = run_bot(state, planner, verbose=not compact,
-                        history=game.get("history"))
+                        history=game.get("history"), game=game)
         game["state"] = state
     if state.player_to_move and args.move and args.move != "-":
         intent = parse_intent(args.move)
@@ -471,6 +550,7 @@ def cmd_move(args):
         move = human_move(state, a, d, b, sw)
         before = state
         state = apply(state, move)
+        _log_move(game, "YOU", before, move, state)
         planner.observe(move.attacks, move.bonuses, move.switch,
                         budget=before.player.actions, turn=before.turn)
         # The opponent's shields are revealed on EVERY resolution; remember
@@ -501,7 +581,7 @@ def cmd_move(args):
         while not (state.player_to_move
                    or state.player.lost or state.opponent.lost):
             state = run_bot(state, planner, verbose=False,
-                            history=game.get("history"))
+                            history=game.get("history"), game=game)
             game["state"] = state
     game["state"] = state
     save(game)
@@ -575,12 +655,14 @@ def human_move(state, a, d, b, sw=None):
     return Allocation(a, d, b, sw)
 
 
-def run_bot(state, planner, verbose=True, history=None):
+def run_bot(state, planner, verbose=True, history=None, game=None):
     """Bot's turn: choose, resolve, and learn what it is entitled to."""
     before = state
     planning = state.__class__(state.opponent, state.player, state.turn, True)
     move = planner.choose(planning)
     after = apply(state, move)
+    if game is not None:
+        _log_move(game, "BOT", before, move, after)
     # The human's shields are revealed on every resolution, regardless of
     # whether the bot attacked (symmetrical with the human's UI). So the bot
     # observes them every turn.
@@ -617,8 +699,9 @@ def main():
                     help="human moves first (overrides the random coin flip)")
     pn.add_argument("--depth", type=int, default=2)
     pn.add_argument("--temp", type=float, default=0.12)
-    pn.add_argument("--bot", choices=["planner", "cfr"], default="planner",
-                    help="bot engine: planner (alpha-beta) or cfr (solver)")
+    pn.add_argument("--bot", choices=["planner", "cfr"], default="cfr",
+                    help="bot engine: cfr (solver, default) or planner "
+                         "(alpha-beta)")
     pn.add_argument("--cfr-iters", type=int, default=120)
     pn.add_argument("--compact", action="store_true",
                     help="compact JSON output (LLM-friendly, one line per turn)")
@@ -628,7 +711,7 @@ def main():
     ps.add_argument("--seed", type=int, default=0)
     ps.add_argument("--depth", type=int, default=2)
     ps.add_argument("--temp", type=float, default=0.12)
-    ps.add_argument("--bot", choices=["planner", "cfr"], default="planner")
+    ps.add_argument("--bot", choices=["planner", "cfr"], default="cfr")
     ps.add_argument("--cfr-iters", type=int, default=120)
     pm = sub.add_parser("move"); pm.add_argument("--run", default="default")
     pm.add_argument("move")

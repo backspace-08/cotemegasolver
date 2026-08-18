@@ -246,21 +246,24 @@ def _masked(state):
 def _pick(probs, rng):
     """Sample directly from the CFR average strategy (no temperature/softmax -
     that would inflate dead branches; the CFR output is already a distribution).
-    Residual-noise cutoff: actions with p < 0.02 are solver noise, zeroed and
-    the rest renormalized. Falls back to argmax only when no rng is given."""
+    Residual-noise cutoff: with ~20 legal actions in an average game, an action
+    with p < 5% after short convergence is worse than a random move, so actions
+    with p < CUTOFF are treated as solver noise, zeroed and the rest
+    renormalized. Falls back to argmax only when no rng is given."""
+    CUTOFF = 0.05
     if rng is None:
         best, best_i = -1.0, 0
         for i, p in enumerate(probs):
             if p > best:
                 best, best_i = p, i
         return best_i
-    total = sum(p for p in probs if p >= 0.02)
+    total = sum(p for p in probs if p >= CUTOFF)
     if total <= 0.0:
         total = sum(probs)
     pick = rng.random() * total
     acc = 0.0
     for i, p in enumerate(probs):
-        if p < 0.02:
+        if p < CUTOFF:
             continue
         acc += p
         if pick <= acc:

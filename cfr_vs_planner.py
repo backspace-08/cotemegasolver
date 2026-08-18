@@ -36,8 +36,11 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
         value_leaf = ValueLeaf(net)
     # 3v3 leaves are now evaluated natively in Rust (Chain DP oracle); no
     # Python leaf provider needed.
+    # Seed a per-bot RNG so _pick SAMPLES the root strategy (not argmax) and
+    # the benchmark stays reproducible per seed.
     cfr = CFRBot(depth=cfr_depth, iters=cfr_iters, cap=cfr_cap,
-                 value_leaf=value_leaf, compress=True)
+                 value_leaf=value_leaf, compress=True,
+                 rng=random.Random(seed * 1000003 + 17))
     pl = Planner(depth=pl_depth, max_nodes=pl_max_nodes)
     lat = []
     try:
