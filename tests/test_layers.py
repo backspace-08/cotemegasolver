@@ -32,7 +32,7 @@ class LayerTests(unittest.TestCase):
 
     def test_planner_only_learns_resolved_shields(self):
         planner = Planner(depth=1)
-        planner.observe(attacks=1, bonuses=2, switched=False)
+        planner.observe(attacks=1, bonuses=2, switched=False, turn=7)
         # The hidden bonuses must not be stored or used to derive exact shields:
         # the record holds the public remainder (0) and zero bonuses.
         self.assertEqual(planner.history.actions[-1], (1, 0, 0, 0))
@@ -45,7 +45,7 @@ class LayerTests(unittest.TestCase):
         # live. Collapsing it to "2 shields" is the bug that made the bot
         # readable.
         planner = Planner(depth=1)
-        planner.observe(attacks=3, bonuses=0, switched=False, budget=5)
+        planner.observe(attacks=3, bonuses=0, switched=False, budget=5, turn=7)
         state = initial((Type.A, Type.B, Type.C), (Type.A, Type.C, Type.D))
         belief = planner.belief(state)
         self.assertEqual(set(belief.probabilities), {0, 1, 2})
@@ -55,14 +55,14 @@ class LayerTests(unittest.TestCase):
         # Spending every action on attacks is self-revealing: nothing is left
         # for shields or bank, so belief becomes exact.
         planner = Planner(depth=1)
-        planner.observe(attacks=3, bonuses=0, switched=False, budget=3)
+        planner.observe(attacks=3, bonuses=0, switched=False, budget=3, turn=7)
         state = initial((Type.A, Type.B, Type.C), (Type.A, Type.C, Type.D))
         self.assertEqual(planner.belief(state).probabilities, {0: 1.0})
 
     def test_attack_evidence_pins_shields_exactly(self):
         # A partially blocked attack is the one fact that fixes the split.
         planner = Planner(depth=1)
-        planner.observe(attacks=3, bonuses=0, switched=False, budget=5)
+        planner.observe(attacks=3, bonuses=0, switched=False, budget=5, turn=7)
         planner.observe_shields(2)
         state = initial((Type.A, Type.B, Type.C), (Type.A, Type.C, Type.D))
         self.assertEqual(planner.belief(state).probabilities, {2: 1.0})

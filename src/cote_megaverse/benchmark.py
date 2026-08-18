@@ -262,7 +262,7 @@ def run_match(seed=0, policy="greedy", depth=2, max_half_turns=100,
                 move = choose_human_policy(state, policy, rng)
             metrics["human_turns"] += 1
             planner.observe(move.attacks, move.bonuses, move.switch,
-                            budget=before.player.actions)
+                            budget=before.player.actions, turn=before.turn)
         else:
             # AI's turn: state.player = human, state.opponent = AI.
             # Flip perspective so the planner sees itself as player.
@@ -396,7 +396,7 @@ def run_self_play(seed=0, max_half_turns=40, depth=2):
         planners[not state.player_to_move].observe(
             move.attacks, move.bonuses, move.switch,
             budget=(state.player if state.player_to_move
-                    else state.opponent).actions)
+                    else state.opponent).actions, turn=state.turn)
         state = apply(state, move)
     winner = "opponent" if state.player.lost else "player" if state.opponent.lost else "draw"
     return {"seed": seed, "winner": winner, "replay": replay, "state": state}

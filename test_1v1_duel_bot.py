@@ -121,7 +121,7 @@ def run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
             state = apply(state, move)
             cfr.observe_shields(before.opponent.shields)
             pl.observe(move.attacks, move.bonuses, move.switch,
-                       budget=before.player.actions)
+                       budget=before.player.actions, turn=before.turn)
         else:
             before = state
             planning = GameState(state.opponent, state.player, state.turn, True)
@@ -129,7 +129,7 @@ def run_duel(seed, cfr_first, profile, cfr_depth, cfr_iters, cfr_cap,
             state = apply(state, move)
             pl.observe_shields(before.player.shields)
             cfr.observe(move.attacks, move.bonuses, move.switch,
-                        budget=before.opponent.actions)
+                        budget=before.opponent.actions, turn=before.turn)
     if state.opponent.lost:
         return {"seed": seed, "cfr_first": cfr_first, "winner": "CFR",
                 "score": WIN, "half_turns": state.turn}

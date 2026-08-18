@@ -27,7 +27,7 @@ def play(args):
         pl[not state.player_to_move].observe(
             move.attacks, move.bonuses, move.switch,
             budget=(state.player if state.player_to_move
-                    else state.opponent).actions)
+                    else state.opponent).actions, turn=state.turn)
         state = apply(state, move)
         turns += 1
     if first_p2m:

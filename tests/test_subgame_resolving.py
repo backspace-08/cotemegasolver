@@ -66,7 +66,7 @@ class TurtlingPunishmentTests(unittest.TestCase):
                                       "switch": False})()
                 state = apply(state, move)
                 bot.observe(move.attacks, move.bonuses, move.switch,
-                            budget=before.opponent.actions)
+                            budget=before.opponent.actions, turn=before.turn)
         return state, moves
 
     def test_turtling_1hp_punishment(self):
@@ -109,14 +109,17 @@ class ShieldPinLifetimeTests(unittest.TestCase):
         self.assertEqual(m._shield_pin, (4, 4))
 
         # a new allocation discards the SHIELD pin (shields are turn-local).
-        # Here the opponent again leaves remainder 4 with a revealed bank of 0,
-        # so the persistent team-bank filter still narrows to (4,0) - that is
-        # legitimate bank evidence, NOT the stale shield observation.
+        # The new reveal (bank 0) resolves the PREVIOUS split (shields 4, bank
+        # 0). The fresh split (R=4) is NOT hard-constrained by the old shields,
+        # but the SOFT memory carries the tendency: shields=4 evidence tilts
+        # the fresh prior toward (4,0) without ever making it certain.
         m.observe_turn(8, 4, 0)
         self.assertIsNone(m._shield_pin)     # shield pin wiped
         self.assertIsNone(m._shield_lb)      # shield lb wiped
-        self.assertIsNotNone(m._bank_pin)    # team bank survives
-        self.assertEqual(m.shield_distribution().get(4, 0.0), 1.0)  # bank filter
+        self.assertEqual(m.records[0].confirmed_shields, 4)  # prev split resolved
+        p4 = m.shield_distribution().get(4, 0.0)
+        self.assertGreater(p4, 0.2)          # tilted toward the observed shields
+        self.assertLess(p4, 1.0)             # soft - never certain
 
         # a switch also discards the shield pin (old fighter's shields vanish).
         # Switch budget is E-1: reveal bank 0 on a remainder of 4.
@@ -128,17 +131,82 @@ class ShieldPinLifetimeTests(unittest.TestCase):
         self.assertIsNone(m2._shield_pin)
         self.assertIsNone(m2._shield_lb)
 
-    def test_bank_pin_survives_new_turn(self):
+    def test_bank_reveal_resolves_previous_split_only(self):
         # reveal bank on turn 8: previous remainder 4, opponent held bank 1.
-        # The pin tracks the MOST RECENT remainder (shield pins are wiped, but
-        # the team bank persists and is re-tagged on every reveal).
+        # The reveal resolves the PREVIOUS split exactly (bank 1 -> shields 3);
+        # the fresh split (R=5) contains no memory of it (different remainder),
+        # so it stays unbiased.
         m = OpponentModel()
         m.observe_turn(7, 4, 0)            # remainder 4 (candidates (4,0)..(0,4))
         m.observe_turn(8, 5, 0)            # budget 5 = base 4 + bank 1 (revealed)
-        self.assertEqual(m._bank_pin, (4, 1))  # pinned to prev remainder 4
-        # the shield pin is gone but the bank pin is NOT wiped on a new turn
-        self.assertIsNotNone(m._bank_pin)
-        self.assertIsNone(m._shield_pin)
+        # the earlier split is now resolved: shields 3, bank 1 (sum = R=4)
+        self.assertEqual(m.records[0].confirmed_shields, 3)
+        # the fresh split (R=5) stays unbiased over its partitions (bank capped
+        # at 4 -> banks 0..4 -> 5 splits)
+        worlds = m.worlds()
+        self.assertEqual(len(worlds), 5)
+        self.assertTrue(all(w.shields + w.bank == 5 for w in worlds))
+        self.assertTrue(all(abs(w.probability - 1.0 / 5) < 1e-9 for w in worlds))
+
+    def test_soft_memory_turtler_tilt(self):
+        # A turtler who repeatedly holds 4 shields / banks 0: the SOFT memory
+        # (memory_prior) tilts the R=4 prior toward (4,0) over turns, but never
+        # to 1.0. (shield_distribution() after observe_our_attack is the hard
+        # turn-local resolve of the CURRENT split and may legitimately be 1.0.)
+        m = OpponentModel()
+        for turn in range(7, 12):
+            m.observe_turn(turn, 4, 0)            # budget 4 = base, R=4, bank 0
+            m.observe_our_attack(5, 4)            # 4 blocked -> shields 4
+        prior = m.memory_prior(4)
+        p4 = sum(v for (s, _), v in prior.items() if s == 4)
+        self.assertGreater(p4, 0.5)               # strongly tilted to 4 shields
+        self.assertLess(p4, 1.0)                  # still soft
+        self.assertGreater(prior[(0, 4)], 0.0)    # 0-shield world never zeroed
+
+    def test_soft_memory_banker_tilt(self):
+        # A banker who repeatedly plays a4 b4 (budget 8, 4 attacks -> R=4, bank
+        # 4, shields 0): the memory tilts the R=4 prior toward (0,4).
+        m = OpponentModel()
+        for turn in range(7, 12):
+            m.observe_turn(turn, 8, 4)            # budget 8, attacks 4 -> bank 4
+            m.observe_our_attack(1, 0)            # 0 blocked of 1 -> shields 0
+        prior = m.memory_prior(4)
+        p0 = sum(v for (s, _), v in prior.items() if s == 0)
+        p4 = sum(v for (s, _), v in prior.items() if s == 4)
+        self.assertGreater(p0, 0.5)               # tilted to 0 shields
+        self.assertLess(p0, 1.0)
+        self.assertLess(p4, 0.3)                  # not tilted to shields
+
+    def test_soft_memory_adapts_to_behaviour_change(self):
+        # Opponent banks 4 for a while, then flips to shields 4. With decay the
+        # fresh shield evidence must outweigh the stale bank evidence, so the
+        # belief re-tilts and is never locked at (0,4).
+        m = OpponentModel()
+        for turn in range(7, 11):                 # banker phase
+            m.observe_turn(turn, 8, 4)
+            m.observe_our_attack(1, 0)
+        assert sum(v for (s, _), v in m.memory_prior(4).items()
+                   if s == 0) > 0.5
+        for turn in range(11, 16):                # turtler phase
+            m.observe_turn(turn, 4, 0)
+            m.observe_our_attack(5, 4)
+        prior = m.memory_prior(4)
+        p4 = sum(v for (s, _), v in prior.items() if s == 4)
+        self.assertGreater(p4, 0.5)               # re-tilted to shields
+        self.assertLess(p4, 1.0)
+
+    def test_soft_memory_never_certain(self):
+        # Even with a long consistent history, the soft memory never reaches
+        # probability 1.0 on any single split.
+        m = OpponentModel()
+        for turn in range(7, 40):
+            m.observe_turn(turn, 4, 0)
+            m.observe_our_attack(5, 4)
+        prior = m.memory_prior(4)
+        self.assertTrue(all(p < 1.0 for p in prior.values()))
+        p4 = sum(v for (s, _), v in prior.items() if s == 4)
+        # steady state at decay 0.85: (4,0)=2/(1-0.85)=13.33 vs 4x1.0 -> 0.77
+        self.assertGreater(p4, 0.75)
 
 
 if __name__ == "__main__":

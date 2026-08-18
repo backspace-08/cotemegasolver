@@ -189,7 +189,6 @@ class Planner:
         self.last_report = {}
         self._search_cache = {}
         self.passive_streak = 0
-        self._observed_turns = 0
         # Credible opponent bank for evaluation, refreshed each `choose` from
         # OpponentModel. Kept as state (not a parameter) so the existing
         # `_search`/`evaluate` call sites stay unchanged. It is public
@@ -203,18 +202,17 @@ class Planner:
         self.max_nodes = max_nodes
         self._nodes_used = 0
 
-    def observe(self, attacks, bonuses=None, switched=False, budget=None,
-                turn=None):
+    def observe(self, attacks, bonuses=None, switched=False, budget=None, *,
+                turn):
         """Record a public opponent allocation.
 
         ``bonuses`` is the opponent's hidden split and is deliberately ignored;
         it is accepted only so existing callers keep working. What is public is
         the budget, the attack count, and a visible switch. Everything else is
         a remainder that stays ambiguous until later evidence resolves it.
+        ``turn`` is the half-turn the observed allocation happened on; required
+        so ``base_budget(turn)`` computes the correct revealed bank.
         """
-        if turn is None:
-            turn = self._observed_turns * 2 + 1
-        self._observed_turns += 1
         if budget is None:
             budget = attacks + int(switched)
         self.model.observe_turn(turn, budget, attacks, switched)

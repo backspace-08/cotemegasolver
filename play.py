@@ -392,7 +392,8 @@ def _play_one_game(game):
                 before = state
                 state = apply(state, move)
                 planner.observe(move.attacks, move.bonuses, move.switch,
-                                budget=before.player.actions)
+                                budget=before.player.actions,
+                                turn=before.turn)
                 show_resolution(before, move, state, "You")
             else:
                 planning = GameState(state.opponent, state.player,
@@ -471,7 +472,7 @@ def cmd_move(args):
         before = state
         state = apply(state, move)
         planner.observe(move.attacks, move.bonuses, move.switch,
-                        budget=before.player.actions)
+                        budget=before.player.actions, turn=before.turn)
         # The opponent's shields are revealed on EVERY resolution; remember
         # the latest revealed value as public info.
         game["sBot"] = before.opponent.shields

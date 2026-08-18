@@ -70,15 +70,22 @@ class OpponentModel:
     records: list[TurnRecord] = field(default_factory=list)
     _candidates: dict[tuple[int, int], float] = field(
         default_factory=lambda: {(0, 0): 1.0})
-    # Observation Consistency Filtering (persistent, survives observe_turn):
-    # a fully/partially revealed attack pins or lower-bounds the shields of
-    # the split that was attacked; a revealed budget pins the bank. Each is
-    # tagged with the remainder it constrains and applied in `_prior` only to
-    # a split of that same remainder, so evidence is never wiped by the prior
-    # reset and a 0-damage attack forces belief to (R, 0).
+    # Soft observation memory: evidence weights over (shields, bank) splits,
+    # accumulated from PUBLIC facts only - a revealed budget (proves the bank
+    # they held) and a resolved attack (proves the shields they held). `_prior`
+    # starts from these weights (Laplace-smoothed to 1.0) instead of a flat
+    # uniform, so the belief TILTS toward the opponent's observed tendency
+    # (e.g. a turtler who repeatedly holds 4 shields) without ever forcing a
+    # split to probability 1 - an opponent can always change behaviour.
+    # Counts decay each observed turn (`decay`) so stale evidence fades and the
+    # belief tracks the CURRENT tendency, not ancient history.
+    _counts: dict[tuple[int, int], float] = field(default_factory=dict)
+    decay: float = 0.85
+    # Turn-local hard constraint for the CURRENT split only (a resolved attack
+    # proves the shields the opponent is holding right now; it legally expires
+    # once they re-allocate). Cross-turn tendency is the soft memory above.
     _shield_pin: tuple[int, int] | None = None   # (remainder, shields) exact
     _shield_lb: tuple[int, int] | None = None    # (remainder, min_shields)
-    _bank_pin: tuple[int, int] | None = None     # (remainder, bank)
 
     # ---------------------------------------------------------------- observe
 
@@ -93,6 +100,7 @@ class OpponentModel:
         ``N`` becomes public on turn ``N + 2``.
         """
         revealed_bank = max(0, budget - base_budget(turn))
+        self._decay_counts()
         self._confirm_previous_bank(revealed_bank)
         remainder = max(0, budget - attacks - int(switched))
         self.records.append(TurnRecord(
@@ -103,9 +111,9 @@ class OpponentModel:
         # switch the old fighter leaves the field (bench enters with 0 shields).
         # A shield pin is strictly a single-turn observation of a SPECIFIC past
         # allocation, never a mapping `remainder -> shields` for future turns.
+        # The cross-turn tendency instead lives in the soft `_counts` memory.
         self._shield_pin = None
         self._shield_lb = None
-        # The team bank persists across turns and switches: `_bank_pin` stays.
         self._candidates = self._prior(remainder)
 
     def observe_our_attack(self, attacks: int, blocked: int):
@@ -125,11 +133,13 @@ class OpponentModel:
             return
         if blocked < attacks:
             self._restrict(lambda shields, bank: shields == blocked)
+            self._add_evidence(lambda s, b: s == blocked)
             if self.records:
                 self._shield_pin = (self.records[-1].remainder, blocked)
                 self._shield_lb = None
         else:
             self._restrict(lambda shields, bank: shields >= attacks)
+            self._add_evidence(lambda s, b: s >= attacks)
             if self.records:
                 self._shield_lb = (self.records[-1].remainder, attacks)
                 self._shield_pin = None
@@ -186,30 +196,58 @@ class OpponentModel:
     # ---------------------------------------------------------------- helpers
 
     def _prior(self, remainder: int) -> dict[tuple[int, int], float]:
-        """Max-entropy uniform prior over the splits of ``remainder``, hard-
-        filtered by observation-consistency facts.
+        """Soft memory prior over the splits of ``remainder``.
 
-        Every legal split carries weight 1/(R+1) - strictly identical to the
-        table builder's ``build_belief_roots``. THEN any split inconsistent
-        with a revealed shield pin / lower bound or a revealed bank is hard-
-        zeroed (likelihood = 0) and the rest renormalized - e.g. an a4 that
-        deals 0 damage against R=4 forces belief to (4, 0) exactly.
+        Base weights come from the accumulated public observation memory
+        (Laplace-smoothed to 1.0), so with no evidence this is exactly the
+        max-entropy uniform 1/(R+1) the table builder uses, and with evidence
+        it tilts toward the opponent's observed tendency - e.g. repeated
+        shield/bank reveals push mass toward ``(R, 0)`` for a turtler. The tilt
+        is SOFT: no split is ever hard-zeroed by memory, so the belief keeps
+        uncertainty. Only the turn-local shield pin / lower bound (the CURRENT
+        split's proven fact) hard-filters.
         """
         splits = legal_splits(remainder)
         if len(splits) == 1:
             return {splits[0]: 1.0}
-        w = 1.0 / len(splits)
-        cand = {s: w for s in splits}
+        cand = {s: self._counts.get(s, 1.0) for s in splits}
         if self._shield_pin is not None and self._shield_pin[0] == remainder:
             cand = {k: v for k, v in cand.items() if k[0] == self._shield_pin[1]}
         elif self._shield_lb is not None and self._shield_lb[0] == remainder:
             cand = {k: v for k, v in cand.items() if k[0] >= self._shield_lb[1]}
-        if self._bank_pin is not None and self._bank_pin[0] == remainder:
-            cand = {k: v for k, v in cand.items() if k[1] == self._bank_pin[1]}
         if not cand:
+            w = 1.0 / len(splits)
             return {s: w for s in splits}
         tot = sum(cand.values())
         return {k: v / tot for k, v in cand.items()}
+
+    def memory_prior(self, remainder: int) -> dict[tuple[int, int], float]:
+        """Normalized soft memory prior over the splits of ``remainder`` (no
+        turn-local hard filters) - used to blend the CSR reach at the solve
+        root so observed tendency reaches the root belief."""
+        splits = legal_splits(remainder)
+        if len(splits) == 1:
+            return {splits[0]: 1.0}
+        w = {s: self._counts.get(s, 1.0) for s in splits}
+        tot = sum(w.values())
+        return {k: v / tot for k, v in w.items()}
+
+    def _decay_counts(self):
+        for key in list(self._counts):
+            self._counts[key] *= self.decay
+            if self._counts[key] < 1e-9:
+                del self._counts[key]
+
+    def _add_evidence(self, predicate, weight: float = 1.0):
+        """Add soft evidence weight to every legal split satisfying
+        ``predicate(shields, bank)`` (public observation only)."""
+        for shields in range(0, MAX_ACTIONS + 1):
+            for bank in range(0, MAX_BONUS + 1):
+                if shields + bank > MAX_ACTIONS:
+                    continue
+                if predicate(shields, bank):
+                    self._counts[(shields, bank)] = \
+                        self._counts.get((shields, bank), 1.0) + weight
 
     def _restrict(self, predicate):
         """Keep only worlds consistent with new evidence."""
@@ -219,15 +257,23 @@ class OpponentModel:
             self._candidates = surviving
 
     def _confirm_previous_bank(self, revealed_bank: int):
-        """A revealed budget proves the bank, hence the earlier split."""
+        """A revealed budget proves the bank, hence the earlier split.
+
+        This resolves the PREVIOUS split (records[-1]) exactly when the live
+        candidates have one consistent candidate; otherwise it narrows them.
+        Either way the revealed bank is also SOFT evidence of the opponent's
+        banking tendency, added to the memory for future priors.
+        """
         if not self.records:
             return
-        prev_rem = self.records[-1].remainder
         self._restrict(lambda shields, bank: bank == revealed_bank)
         consistent = [key for key in self._candidates if key[1] == revealed_bank]
         if len(consistent) == 1:
             shields = consistent[0][0]
             self.records[-1] = TurnRecord(
                 **{**self.records[-1].__dict__, "confirmed_shields": shields})
-        if consistent:
-            self._bank_pin = (prev_rem, revealed_bank)
+            # the split is fully known: precise joint tendency evidence
+            self._add_evidence(lambda s, b: s == shields and b == revealed_bank)
+        else:
+            # bank alone known: bank-line tendency evidence
+            self._add_evidence(lambda s, b: b == revealed_bank)

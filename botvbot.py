@@ -52,7 +52,7 @@ def run_match(seed, new_first, left="v3", right="v2", bodies=3, depth=2,
             state = apply(state, move)
             left_pl.observe_shields(before.opponent.shields)
             right_pl.observe(move.attacks, move.bonuses, move.switch,
-                             budget=before.player.actions)
+                             budget=before.player.actions, turn=before.turn)
         else:
             before = state
             planning = GameState(state.opponent, state.player, state.turn, True)
@@ -60,7 +60,7 @@ def run_match(seed, new_first, left="v3", right="v2", bodies=3, depth=2,
             state = apply(state, move)
             right_pl.observe_shields(before.player.shields)
             left_pl.observe(move.attacks, move.bonuses, move.switch,
-                            budget=before.opponent.actions)
+                            budget=before.opponent.actions, turn=before.turn)
     if state.opponent.lost:
         return {"seed": seed, "new_first": new_first, "winner": "LEFT"}
     if state.player.lost:

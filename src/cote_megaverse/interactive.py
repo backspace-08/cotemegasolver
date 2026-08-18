@@ -189,7 +189,7 @@ def play(player_team, bot_team, depth=SEARCH_DEPTH, input_fn=input, output_fn=pr
             before = state
             state = apply(state, move)
             bot.observe(move.attacks, move.bonuses, move.switch,
-                        budget=before.player.actions)
+                        budget=before.player.actions, turn=before.turn)
             show_resolution(before, move, state, "You")
         else:
             planning = GameState(state.opponent, state.player, state.turn, True)

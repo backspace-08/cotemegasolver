@@ -55,7 +55,7 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
                 # full on every resolution (RULES.md §8).
                 cfr.observe_shields(before.opponent.shields)
                 pl.observe(move.attacks, move.bonuses, move.switch,
-                           budget=before.player.actions)
+                           budget=before.player.actions, turn=before.turn)
             else:
                 before = state
                 planning = GameState(state.opponent, state.player, state.turn, True)
@@ -65,7 +65,7 @@ def run_match(seed, new_first, cfr_depth, cfr_iters, cfr_cap,
                 # full on every resolution (RULES.md §8).
                 pl.observe_shields(before.player.shields)
                 cfr.observe(move.attacks, move.bonuses, move.switch,
-                            budget=before.opponent.actions)
+                            budget=before.opponent.actions, turn=before.turn)
     except Exception:
         import traceback
         with open(os.path.join(BASE, "table_out", "worker_err.log"), "w") as fh:

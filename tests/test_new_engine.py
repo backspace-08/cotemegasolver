@@ -131,7 +131,7 @@ class NewEngineTests(unittest.TestCase):
             player_to_move=True,
         )
         planner = Planner(depth=3)
-        planner.observe(attacks=3, bonuses=0, switched=False, budget=5)
+        planner.observe(attacks=3, bonuses=0, switched=False, budget=5, turn=6)
         move = planner.choose(state)
         # Budget 5 minus 3 public attacks leaves a remainder of 2, which split
         # into shields and bank in unknown proportion. All three worlds must
@@ -163,7 +163,7 @@ class NewEngineTests(unittest.TestCase):
             player_to_move=True,
         )
         planner = Planner(depth=3)
-        planner.observe(attacks=0, bonuses=0, switched=False, budget=8)
+        planner.observe(attacks=0, bonuses=0, switched=False, budget=8, turn=8)
         move = planner.choose(state)
         belief = planner.last_report["belief"]
         self.assertEqual(min(belief), 4)
@@ -180,7 +180,7 @@ class NewEngineTests(unittest.TestCase):
             Side(player, actions=2), Side(opponent), turn=2,
             player_to_move=True)
         planner = Planner(depth=1)
-        planner.observe(attacks=0, bonuses=0, switched=False, budget=0)
+        planner.observe(attacks=0, bonuses=0, switched=False, budget=0, turn=2)
         move = planner.choose(state)
         self.assertEqual(move.attacks, 2)
         self.assertTrue(planner.last_report["tactical_outcome"]["guaranteed_lethal"])
@@ -196,7 +196,7 @@ class NewEngineTests(unittest.TestCase):
             Side(player, actions=3), Side(opponent), turn=2,
             player_to_move=True)
         planner = Planner(depth=1)
-        planner.observe(attacks=0, bonuses=0, switched=False, budget=0)
+        planner.observe(attacks=0, bonuses=0, switched=False, budget=0, turn=2)
         move = planner.choose(state)
         self.assertEqual((move.attacks, move.defends), (2, 1))
         self.assertTrue(planner.last_report["tactical_outcome"]["kill_and_defend"])
