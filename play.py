@@ -126,6 +126,69 @@ def _act_str(side):
     return f"#{side.active}:{c.type.name}/{c.hp}/{c.atk}"
 
 
+_METRIC_KEYS = ("turns", "attacks", "shields", "bank", "switches", "hits_landed",
+                "fully_blocked_attacks", "attacks_into_wall", "noattack_turns",
+                "bank_turns", "bursts", "kills")
+
+
+def _empty_side():
+    return {k: 0 for k in _METRIC_KEYS} | {"noattack_streak": 0,
+                                           "max_noattack_streak": 0,
+                                           "max_bank": 0, "mult": {}}
+
+
+def _update_metrics(game, tag, before, move, after):
+    """Accumulate exploitable-behavior counters (attack/bank/shield/switch
+    usage, wasted attacks into a shield wall, turtling streaks, bursts, kills,
+    and the type-multiplier distribution) per side."""
+    m = game.setdefault("metrics", {"YOU": _empty_side(), "BOT": _empty_side()})
+    s = m[tag]
+    s["turns"] += 1
+    s["attacks"] += move.attacks
+    s["shields"] += move.defends
+    s["bank"] += move.bonuses
+    if move.switch_to is not None:
+        s["switches"] += 1
+    if move.attacks == 0:
+        s["noattack_turns"] += 1
+        s["noattack_streak"] += 1
+        s["max_noattack_streak"] = max(s["max_noattack_streak"],
+                                       s["noattack_streak"])
+    else:
+        s["noattack_streak"] = 0
+    def_sh = (before.opponent.shields if tag == "YOU"
+              else before.player.shields)
+    blocked = min(move.attacks, def_sh)
+    landed = move.attacks - blocked
+    s["hits_landed"] += landed
+    if move.attacks > 0:
+        if blocked == move.attacks:
+            s["fully_blocked_attacks"] += 1
+            if def_sh >= 4:
+                s["attacks_into_wall"] += 1
+        if tag == "YOU":
+            atk_i = (move.switch_to if move.switch_to is not None
+                     else before.player.active)
+            atk_c = before.player.characters[atk_i]
+            def_c = before.opponent.characters[before.opponent.active]
+        else:
+            atk_i = (move.switch_to if move.switch_to is not None
+                     else before.opponent.active)
+            atk_c = before.opponent.characters[atk_i]
+            def_c = before.player.characters[before.player.active]
+        mlt = multiplier(atk_c.type, def_c.type)
+        s["mult"][mlt] = s["mult"].get(mlt, 0) + 1
+    if move.bonuses > 0:
+        s["bank_turns"] += 1
+        s["max_bank"] = max(s["max_bank"], move.bonuses)
+    budget = (before.player.actions if tag == "YOU"
+              else before.opponent.actions)
+    if budget >= 6 and move.attacks >= 5:
+        s["bursts"] += 1
+    if after.opponent.lost if tag == "YOU" else after.player.lost:
+        s["kills"] += 1
+
+
 def _log_move(game, tag, before, move, after):
     """Append a detailed per-turn entry to game['dlog'] (types, HP, ATK,
     actives, budget, and for the bot's turn its belief/reach/value)."""
@@ -160,6 +223,7 @@ def _log_move(game, tag, before, move, after):
             entry["reach"] = [[s, k, round(float(p), 3)]
                               for (s, k), p in reach.items()]
     game["dlog"].append(entry)
+    _update_metrics(game, tag, before, move, after)
 
 
 def _write_game_log(game):
@@ -177,6 +241,7 @@ def _write_game_log(game):
         "result": _winner_of(game),
         "rosters": game.get("start_roster") or [],
         "turns": dlog,
+        "metrics": game.get("metrics", {}),
     }
     with open(os.path.join(out_dir, f"game_{game['seed']}.json"), "w",
               encoding="utf-8") as fh:
@@ -600,6 +665,54 @@ def cmd_move(args):
             print(render(state, idx, total, history=game.get("history")))
 
 
+def cmd_metrics(args):
+    """Aggregate exploitable-behavior metrics across all finished game logs in
+    this run (runs/<run>/game_logs/game_*.json)."""
+    d = os.path.join(_BASE, "runs", RUN, "game_logs")
+    if not os.path.isdir(d):
+        print(f"no game logs in runs/{RUN}/game_logs")
+        return
+    games = []
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".json"):
+            try:
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    games.append(json.load(fh))
+            except Exception:
+                continue
+    if not games:
+        print("no parsed game logs")
+        return
+    agg = {"YOU": _empty_side(), "BOT": _empty_side()}
+    n = len(games)
+    wins = {"YOU": 0, "BOT": 0, "DRAW": 0}
+    total_plies = 0
+    for g in games:
+        total_plies += len(g.get("turns", []))
+        wins[g.get("result", "DRAW")] = wins.get(g.get("result", "DRAW"), 0) + 1
+        for tag in ("YOU", "BOT"):
+            a = agg[tag]
+            s = g.get("metrics", {}).get(tag, {})
+            for k in _METRIC_KEYS:
+                a[k] = a.get(k, 0) + s.get(k, 0)
+            a["max_noattack_streak"] = max(a.get("max_noattack_streak", 0),
+                                           s.get("max_noattack_streak", 0))
+            a["max_bank"] = max(a.get("max_bank", 0), s.get("max_bank", 0))
+            for mlt, c in (s.get("mult") or {}).items():
+                a.setdefault("mult", {})[mlt] = a["mult"].get(mlt, 0) + c
+    print(f"=== metrics: {n} games | W={wins.get('YOU',0)} L={wins.get('BOT',0)} "
+          f"D={wins.get('DRAW',0)} | avg plies={total_plies / max(1, n):.1f} ===")
+    for tag in ("YOU", "BOT"):
+        a = agg[tag]
+        print(f"--- {tag} ---")
+        for k in _METRIC_KEYS:
+            print(f"  {k:22s}: {a.get(k, 0)}")
+        print(f"  {'max_noattack_streak':22s}: {a.get('max_noattack_streak', 0)}")
+        print(f"  {'max_bank':22s}: {a.get('max_bank', 0)}")
+        print(f"  {'mult distribution':22s}: "
+              + ", ".join(f"{k}={v}" for k, v in sorted(a.get('mult', {}).items())))
+
+
 def cmd_view(args):
     game = load()
     if game.get("compact"):
@@ -718,6 +831,7 @@ def main():
     pv = sub.add_parser("view"); pv.add_argument("--run", default="default")
     pe = sub.add_parser("end"); pe.add_argument("--run", default="default")
     pst = sub.add_parser("stats"); pst.add_argument("--run", default="default")
+    pm2 = sub.add_parser("metrics"); pm2.add_argument("--run", default="default")
     args = p.parse_args()
     _set_run(args.run)
     if args.cmd == "new":
@@ -732,6 +846,8 @@ def main():
         cmd_end(args)
     elif args.cmd == "stats":
         show_stats(args.run)
+    elif args.cmd == "metrics":
+        cmd_metrics(args)
     else:
         p.print_help()
 
